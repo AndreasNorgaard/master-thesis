@@ -17,8 +17,8 @@ class Model1:
         self.bat_charge_eff = 0.99  # Charging efficiency
         self.bat_discharge_eff = 0.86  # Discharging efficiency
         self.soc_initial = 0.50  # Initial state of charge (fraction of Bat^MWh)
-        self.soc_min = 0.10  # Minimum state of charge (fraction)
-        self.soc_max = 0.90  # Maximum state of charge (fraction)
+        self.soc_min = 0.10 * self.bat_mwh  # Minimum state of charge (MWh)
+        self.soc_max = 0.90 * self.bat_mwh  # Maximum state of charge (MWh)
         self.soc_quarterly_loss = 0.0002083  # Self-discharge rate per period
         self.delta_t = 0.25  # Length of each time interval (hours)
         self.cycle_cost = 0.0  # Degradation cost (EUR/MWh)
@@ -67,7 +67,7 @@ class Model1:
         """
         Constraint: State of Charge Limits
         """
-        return (model.soc_min * model.bat_mwh, model.soc_max * model.bat_mwh)
+        return (model.soc_min, model.soc_max)
 
     def equation_5(self, model, q):
         """
