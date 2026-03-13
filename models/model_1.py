@@ -61,7 +61,7 @@ class Model1:
         """
         Constraint: Discharging limit
         """
-        return (0, model.bat_mw)
+        return (0, model.bat_discharge_eff * model.bat_mw)
 
     def equation_4(self, model, q):
         """
