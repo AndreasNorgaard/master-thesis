@@ -18,6 +18,18 @@ Copy `.env.example` to `.env` and fill in your API keys:
 cp .env.example .env
 ```
 
+## Running Models
+
+Ensure the virtual environment is activated first (see [Setup](#setup)), then:
+
+```bash
+# Run Model 1 (profit maximization)
+python -m models.model_1
+
+# Run Model 2 (multi-objective: profit + CO2)
+python -m models.model_2
+```
+
 ## Common Commands
 
 ```bash
