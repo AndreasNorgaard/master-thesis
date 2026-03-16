@@ -1,3 +1,4 @@
+import plotly.graph_objects as go
 import polars as pl
 import pyomo.environ as pyo
 
@@ -201,6 +202,75 @@ class Model2:
 
         return model
 
+    def _extract_objectives(self, model) -> tuple[float, float]:
+        """Extract actual (unweighted) profit and CO2 from a solved model."""
+        profit = sum(
+            self.delta_t
+            * (
+                pyo.value(model.da_sell[q])
+                * (pyo.value(model.da_price[q]) - self.tariff_prod)
+                - pyo.value(model.da_buy[q])
+                * (pyo.value(model.da_price[q]) + self.tariff_cons)
+                - self.cycle_cost
+                * (pyo.value(model.da_buy[q]) + pyo.value(model.da_sell[q]))
+            )
+            for q in model.quarters
+        )
+        co2 = sum(
+            self.delta_t
+            * pyo.value(model.gamma[q])
+            * (pyo.value(model.da_buy[q]) - pyo.value(model.da_sell[q]))
+            for q in model.quarters
+        )
+        return profit, co2
+
+    def pareto_frontier(self) -> list[dict]:
+        """Solve the model 11 times across evenly spaced weight combinations and return results."""
+        weight_pairs = [(round(1.0 - i * 0.1, 1), round(i * 0.1, 1)) for i in range(11)]
+        results = []
+
+        for lp, lc in weight_pairs:
+            self.lambda_profit = lp
+            self.lambda_co2 = lc
+            solved = self.solve()
+            profit, co2 = self._extract_objectives(solved)
+            results.append(
+                {"lambda_profit": lp, "lambda_co2": lc, "profit": profit, "co2": co2}
+            )
+            print(
+                f"λ_profit={lp:.1f}, λ_co2={lc:.1f} → Profit={profit:.2f} DKK, CO2={co2:.4f} kg"
+            )
+
+        return results
+
+    def visualize_pareto_frontier(self, results: list[dict]):
+        """Plot the Pareto frontier from the results of pareto_frontier()."""
+        profits = [r["profit"] for r in results]
+        co2s = [r["co2"] for r in results]
+        labels = [
+            f"λ=({r['lambda_profit']:.1f}, {r['lambda_co2']:.1f})" for r in results
+        ]
+
+        fig = go.Figure(
+            go.Scatter(
+                x=profits,
+                y=co2s,
+                mode="lines+markers+text",
+                text=labels,
+                textposition="top right",
+                textfont=dict(size=10),
+                marker=dict(size=8, color="steelblue"),
+                line=dict(color="steelblue", width=1.5),
+            )
+        )
+        fig.update_layout(
+            title="Pareto Frontier — Profit vs. CO₂ Emissions",
+            xaxis_title="Profit (DKK)",
+            yaxis_title="CO₂ Emissions (kg)",
+            template="plotly_white",
+        )
+        fig.show()
+
     def calculate_profit(self):
         pass
 
@@ -212,10 +282,9 @@ class Model2:
 
 
 if __name__ == "__main__":
-    model = Model2(
+    m = Model2(
         start_date="2026-01-01",
         end_date="2026-01-31",
-        lambda_profit=0.5,
-        lambda_co2=0.5,
     )
-    model.solve()
+    pareto_results = m.pareto_frontier()
+    m.visualize_pareto_frontier(pareto_results)
