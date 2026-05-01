@@ -233,8 +233,33 @@ class Model1:
 
         return model
 
-    def calculate_profit(self):
-        pass
+    def calculate_profit(self, model):
+        Q = len(self.df)
+        revenue = sum(
+            self.delta_t
+            * pyo.value(model.da_sell[q])
+            * (pyo.value(model.da_price[q]) - self.tariff_prod)
+            for q in range(1, Q + 1)
+        )
+        cost_buy = sum(
+            self.delta_t
+            * pyo.value(model.da_buy[q])
+            * (pyo.value(model.da_price[q]) + self.df["tariff_cons"][q - 1])
+            for q in range(1, Q + 1)
+        )
+        degradation = sum(
+            self.delta_t
+            * self.cycle_cost
+            * (pyo.value(model.da_buy[q]) + pyo.value(model.da_sell[q]))
+            for q in range(1, Q + 1)
+        )
+        profit = revenue - cost_buy - degradation
+
+        print(f"Revenue from selling:    {revenue:>10.2f} EUR")
+        print(f"Cost of buying:          {cost_buy:>10.2f} EUR")
+        print(f"Degradation cost:        {degradation:>10.2f} EUR")
+        print(f"Net profit:              {profit:>10.2f} EUR")
+        return profit
 
     def visualize_profit(self):
         pass
@@ -244,5 +269,6 @@ class Model1:
 
 
 if __name__ == "__main__":
-    model = Model1(start_date="2026-04-01", end_date="2026-04-30")
-    model.solve()
+    m = Model1(start_date="2026-04-01", end_date="2026-04-30")
+    solved = m.solve()
+    m.calculate_profit(solved)
