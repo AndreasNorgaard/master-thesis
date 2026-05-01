@@ -3,6 +3,7 @@ name = "master-thesis"
 version = "0.1.0"
 requires-python = "==3.12"
 dependencies = [
+    "holidays>=0.95",
     "openpyxl>=3.1.5",
     "plotly>=6.5.2",
     "polars",
