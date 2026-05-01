@@ -313,6 +313,7 @@ class Model1:
             showlegend=False,
         )
         fig.show()
+        fig.write_image("results/model_1_profit.png")
 
     def visualize_schedule(self, model):
         Q = len(self.df)
@@ -401,6 +402,7 @@ class Model1:
         )
 
         fig.show()
+        fig.write_image("results/model_1_schedule.png")
 
 
 if __name__ == "__main__":

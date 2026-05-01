@@ -359,6 +359,7 @@ class Model2:
             template="plotly_white",
         )
         fig.show()
+        fig.write_image("results/model_2_pareto_frontier.png")
 
 
 if __name__ == "__main__":
