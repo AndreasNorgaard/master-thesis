@@ -237,34 +237,87 @@ class Model1:
 
     def calculate_profit(self, model):
         Q = len(self.df)
-        revenue = sum(
-            self.delta_t
-            * pyo.value(model.da_sell[q])
-            * (pyo.value(model.da_price[q]) - self.tariff_prod)
-            for q in range(1, Q + 1)
+        da_sell_vals = [pyo.value(model.da_sell[q]) for q in range(1, Q + 1)]
+        da_buy_vals = [pyo.value(model.da_buy[q]) for q in range(1, Q + 1)]
+        da_price_vals = [pyo.value(model.da_price[q]) for q in range(1, Q + 1)]
+        tariff_cons_vals = self.df["tariff_cons"].to_list()
+
+        da_revenue = self.delta_t * sum(
+            s * p for s, p in zip(da_sell_vals, da_price_vals)
         )
-        cost_buy = sum(
-            self.delta_t
-            * pyo.value(model.da_buy[q])
-            * (pyo.value(model.da_price[q]) + self.df["tariff_cons"][q - 1])
-            for q in range(1, Q + 1)
+        prod_tariff = self.delta_t * sum(s * self.tariff_prod for s in da_sell_vals)
+        da_cost = self.delta_t * sum(b * p for b, p in zip(da_buy_vals, da_price_vals))
+        cons_tariff = self.delta_t * sum(
+            b * t for b, t in zip(da_buy_vals, tariff_cons_vals)
         )
-        degradation = sum(
+        degradation = (
             self.delta_t
             * self.cycle_cost
-            * (pyo.value(model.da_buy[q]) + pyo.value(model.da_sell[q]))
-            for q in range(1, Q + 1)
+            * sum(b + s for b, s in zip(da_buy_vals, da_sell_vals))
         )
-        profit = revenue - cost_buy - degradation
+        profit = da_revenue - prod_tariff - da_cost - cons_tariff - degradation
 
-        print(f"Revenue from selling:    {revenue:>10.2f} EUR")
-        print(f"Cost of buying:          {cost_buy:>10.2f} EUR")
-        print(f"Degradation cost:        {degradation:>10.2f} EUR")
-        print(f"Net profit:              {profit:>10.2f} EUR")
+        print(f"Day-ahead Revenue:       {da_revenue:>10.2f} EUR")
+        print(f"Production Tariffs:      {-prod_tariff:>10.2f} EUR")
+        print(f"Day-ahead Cost:          {-da_cost:>10.2f} EUR")
+        print(f"Consumption Tariffs:     {-cons_tariff:>10.2f} EUR")
+        print(f"Degradation Cost:        {-degradation:>10.2f} EUR")
+        print(f"Net Profit:              {profit:>10.2f} EUR")
+
+        self.profit_components = {
+            "da_revenue": da_revenue,
+            "prod_tariff": prod_tariff,
+            "da_cost": da_cost,
+            "cons_tariff": cons_tariff,
+            "degradation": degradation,
+            "profit": profit,
+        }
         return profit
 
     def visualize_profit(self):
-        pass
+        c = self.profit_components
+        labels = [
+            "Day-ahead Revenue",
+            "Production Tariffs",
+            "Day-ahead Cost",
+            "Consumption Tariffs",
+            "Degradation Cost",
+            "Profit",
+        ]
+        values = [
+            c["da_revenue"],
+            -c["prod_tariff"],
+            -c["da_cost"],
+            -c["cons_tariff"],
+            -c["degradation"],
+            None,  # computed automatically as total by Waterfall
+        ]
+        measures = ["relative", "relative", "relative", "relative", "relative", "total"]
+
+        fig = go.Figure(
+            go.Waterfall(
+                orientation="v",
+                measure=measures,
+                x=labels,
+                y=values,
+                text=[
+                    f"{v:.2f}" if v is not None else f"{c['profit']:.2f}"
+                    for v in values
+                ],
+                textposition="outside",
+                increasing={"marker": {"color": "green"}},
+                decreasing={"marker": {"color": "red"}},
+                totals={"marker": {"color": "steelblue"}},
+                connector={"line": {"color": "grey", "width": 1}},
+            )
+        )
+        fig.update_layout(
+            title="Profit Distribution - Model 1",
+            yaxis_title="EUR",
+            plot_bgcolor="aliceblue",
+            showlegend=False,
+        )
+        fig.show()
 
     def visualize_schedule(self, model):
         Q = len(self.df)
@@ -359,4 +412,5 @@ if __name__ == "__main__":
     m = Model1(start_date="2026-04-01", end_date="2026-04-30")
     solved = m.solve()
     m.calculate_profit(solved)
+    m.visualize_profit()
     m.visualize_schedule(solved)
