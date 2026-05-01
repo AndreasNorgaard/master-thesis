@@ -1,6 +1,8 @@
 import holidays
+import plotly.graph_objects as go
 import polars as pl
 import pyomo.environ as pyo
+from plotly.subplots import make_subplots
 
 from data.energi_data_service import EnergiDataServiceAPIClient
 
@@ -264,11 +266,97 @@ class Model1:
     def visualize_profit(self):
         pass
 
-    def visualize_schedule(self):
-        pass
+    def visualize_schedule(self, model):
+        Q = len(self.df)
+        times = self.df["TimeDK"].to_list()
+
+        soc = [pyo.value(model.soc[q]) / self.bat_mwh for q in range(1, Q + 1)]
+        da_buy = [pyo.value(model.da_buy[q]) for q in range(1, Q + 1)]
+        da_sell = [-pyo.value(model.da_sell[q]) for q in range(1, Q + 1)]
+
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+        # Shaded SoC feasible band
+        soc_min_frac = self.soc_min / self.bat_mwh
+        soc_max_frac = self.soc_max / self.bat_mwh
+        fig.add_hrect(
+            y0=soc_min_frac,
+            y1=soc_max_frac,
+            fillcolor="steelblue",
+            opacity=0.15,
+            layer="below",
+            line_width=0,
+            secondary_y=False,
+        )
+
+        # Charging bars (positive, red)
+        fig.add_trace(
+            go.Bar(
+                x=times,
+                y=da_buy,
+                name="Day-ahead buy (Charge)",
+                marker_color="red",
+                opacity=0.85,
+            ),
+            secondary_y=True,
+        )
+
+        # Discharging bars (negative, green)
+        fig.add_trace(
+            go.Bar(
+                x=times,
+                y=da_sell,
+                name="Day-ahead sell (Discharge)",
+                marker_color="green",
+                opacity=0.85,
+            ),
+            secondary_y=True,
+        )
+
+        # State of Charge line
+        fig.add_trace(
+            go.Scatter(
+                x=times,
+                y=soc,
+                name="State of Charge",
+                mode="lines",
+                line=dict(color="black", width=1.5),
+            ),
+            secondary_y=False,
+        )
+
+        fig.update_layout(
+            title="Visualization of Production Schedule from Model 1",
+            barmode="overlay",
+            plot_bgcolor="white",
+            legend=dict(
+                orientation="h",
+                yanchor="top",
+                y=-0.15,
+                xanchor="center",
+                x=0.5,
+            ),
+            xaxis=dict(showgrid=False),
+        )
+        fig.update_yaxes(
+            title_text="SoC [%]",
+            range=[0, 1],
+            secondary_y=False,
+            showgrid=True,
+            gridcolor="lightgrey",
+        )
+        fig.update_yaxes(
+            title_text="Effect [MW]",
+            range=[-(self.bat_mw + 0.2), self.bat_mw + 0.2],
+            secondary_y=True,
+            showgrid=False,
+        )
+
+        fig.show()
 
 
 if __name__ == "__main__":
     m = Model1(start_date="2026-04-01", end_date="2026-04-30")
     solved = m.solve()
     m.calculate_profit(solved)
+    m.visualize_schedule(solved)
