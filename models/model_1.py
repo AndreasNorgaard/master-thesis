@@ -25,13 +25,12 @@ class Model1:
         self.soc_max = 0.95 * self.bat_mwh  # Maximum state of charge (MWh)
         self.soc_quarterly_loss = 0.025 / (30 * 24 * 4)  # 0.025% per month
         self.delta_t = 0.25  # Length of each time interval (hours)
-        self.cycle_cost = 13.0  # Degradation cost (EUR/MWh)
+        self.cycle_cost = 13.0 * 7.44  # Degradation cost (DKK/MWh)
         self.n_cycles = 2  # Max full cycles per day (contractual limit)
 
         # Tariffs (Appendix B of thesis, DKK/MWh)
         # Production tariff (discharging): TSO (5.0 + 5.3) + DSO (5.2) = 15.5 DKK/MWh
-        # Convert production tariff from DKK to EUR (using 1 EUR = 7.45 DKK)
-        self.tariff_prod = 15.5 / 7.44  # EUR/MWh
+        self.tariff_prod = 15.5
 
         # Consumption tariff (charging): time-varying, computed in load_data()
         # τ_c_q = systemtarif + nettabstarif_q + DSO_q
@@ -44,23 +43,19 @@ class Model1:
         self.load_data()
 
     def load_data(self):
-        df_hourly = EnergiDataServiceAPIClient(
+        df_quarters = EnergiDataServiceAPIClient(
             start_date=self.start_date,
             end_date=self.end_date,
             price_area="DK2",
         ).day_ahead_prices(write_to_file=False)
 
-        # Expand each hourly row into 4 identical 15-min quarters
-        df_hourly = df_hourly.with_columns(
-            pl.col("TimeDK").str.to_datetime("%Y-%m-%dT%H:%M:%S", strict=False)
-        )
-        df_quarters = df_hourly.select(["TimeDK", "DayAheadPriceDKK"]).with_columns(
-            pl.lit(4).alias("repeat_count")
-        )
-        # Repeat each row 4 times to get 15-min resolution
-        df_quarters = df_quarters.select(
-            pl.col("TimeDK").repeat_by("repeat_count").explode(),
-            pl.col("DayAheadPriceDKK").repeat_by("repeat_count").explode(),
+        # API already returns 15-min resolution; just parse TimeDK and sort ascending
+        df_quarters = (
+            df_quarters.select(["TimeDK", "DayAheadPriceDKK"])
+            .with_columns(
+                pl.col("TimeDK").str.to_datetime("%Y-%m-%dT%H:%M:%S", strict=False)
+            )
+            .sort("TimeDK")
         )
 
         # Compute time-varying consumption tariff per quarter
@@ -91,8 +86,8 @@ class Model1:
             )
             .with_columns(
                 (
-                    72.0 / 7.44
-                    + 0.0142 * (pl.col("DayAheadPriceDKK") + (26.0 / 7.44))
+                    72.0
+                    + 0.0142 * (pl.col("DayAheadPriceDKK") + 26.0)
                     + pl.col("dso_tariff")
                 ).alias("tariff_cons")
             )
@@ -257,12 +252,12 @@ class Model1:
         )
         profit = da_revenue - prod_tariff - da_cost - cons_tariff - degradation
 
-        print(f"Day-ahead Revenue:       {da_revenue:>10.2f} EUR")
-        print(f"Production Tariffs:      {-prod_tariff:>10.2f} EUR")
-        print(f"Day-ahead Cost:          {-da_cost:>10.2f} EUR")
-        print(f"Consumption Tariffs:     {-cons_tariff:>10.2f} EUR")
-        print(f"Degradation Cost:        {-degradation:>10.2f} EUR")
-        print(f"Net Profit:              {profit:>10.2f} EUR")
+        print(f"Day-ahead Revenue:       {da_revenue:>10.2f} DKK")
+        print(f"Production Tariffs:      {-prod_tariff:>10.2f} DKK")
+        print(f"Day-ahead Cost:          {-da_cost:>10.2f} DKK")
+        print(f"Consumption Tariffs:     {-cons_tariff:>10.2f} DKK")
+        print(f"Degradation Cost:        {-degradation:>10.2f} DKK")
+        print(f"Net Profit:              {profit:>10.2f} DKK")
 
         self.profit_components = {
             "da_revenue": da_revenue,
@@ -313,7 +308,7 @@ class Model1:
         )
         fig.update_layout(
             title="Profit Distribution - Model 1",
-            yaxis_title="EUR",
+            yaxis_title="DKK",
             plot_bgcolor="aliceblue",
             showlegend=False,
         )
