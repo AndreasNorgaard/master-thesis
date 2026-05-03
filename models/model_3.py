@@ -694,21 +694,110 @@ class Model3:
         print(f"  Total Profit:        {profit:>12.2f} DKK")
         print(f"  CO2 Emissions:       {co2:>12.4f} kg")
 
-        return profit, co2
+        breakdown = {
+            "da_revenue": da_revenue,
+            "prod_tariff": -prod_tariff,
+            "da_cost": -da_cost,
+            "cons_tariff": -cons_tariff,
+            "degradation": -degradation,
+            "da_profit": da_profit,
+            "ffr_revenue": ffr_rev,
+            "fcrd_up_revenue": fcrd_up_rev,
+            "fcrd_down_revenue": fcrd_down_rev,
+            "fcrn_revenue": fcrn_rev,
+            "afrr_up_revenue": afrr_up_rev,
+            "afrr_down_revenue": afrr_down_rev,
+            "mfrr_up_revenue": mfrr_up_rev,
+            "mfrr_down_revenue": mfrr_down_rev,
+            "reserve_revenue": reserve_rev,
+            "profit": profit,
+            "co2": co2,
+        }
+        return profit, co2, breakdown
+
+    def visualize_profit_distribution(
+        self,
+        breakdown: dict,
+        lambda_profit: float,
+        lambda_co2: float,
+    ) -> None:
+        """Plot a waterfall chart of the profit breakdown for one weight pair."""
+        labels = [
+            "Day-ahead Revenue",
+            "Production Tariffs",
+            "Day-ahead Cost",
+            "Consumption Tariffs",
+            "Degradation Cost",
+            "FFR Revenue",
+            "FCR-D up Revenue",
+            "FCR-D down Revenue",
+            "FCR-N Revenue",
+            "aFRR up Revenue",
+            "aFRR down Revenue",
+            "mFRR up Revenue",
+            "mFRR down Revenue",
+            "Profit",
+        ]
+        values = [
+            breakdown["da_revenue"],
+            breakdown["prod_tariff"],
+            breakdown["da_cost"],
+            breakdown["cons_tariff"],
+            breakdown["degradation"],
+            breakdown["ffr_revenue"],
+            breakdown["fcrd_up_revenue"],
+            breakdown["fcrd_down_revenue"],
+            breakdown["fcrn_revenue"],
+            breakdown["afrr_up_revenue"],
+            breakdown["afrr_down_revenue"],
+            breakdown["mfrr_up_revenue"],
+            breakdown["mfrr_down_revenue"],
+            None,
+        ]
+        measures = ["relative"] * (len(labels) - 1) + ["total"]
+
+        fig = go.Figure(
+            go.Waterfall(
+                orientation="v",
+                measure=measures,
+                x=labels,
+                y=values,
+                text=[
+                    f"{v:.2f}" if v is not None else f"{breakdown['profit']:.2f}"
+                    for v in values
+                ],
+                textposition="outside",
+                increasing={"marker": {"color": "green"}},
+                decreasing={"marker": {"color": "red"}},
+                totals={"marker": {"color": "steelblue"}},
+                connector={"line": {"color": "grey", "width": 1}},
+            )
+        )
+        fig.update_layout(
+            title=f"Profit Distribution - Model 3 (λ_profit={lambda_profit}, λ_co2={lambda_co2})",
+            yaxis_title="DKK",
+            plot_bgcolor="aliceblue",
+            showlegend=False,
+        )
+        fig.show()
+        fig.write_image(f"results/model_3_profit_lp{lambda_profit}_lc{lambda_co2}.png")
 
     def pareto_frontier(self) -> list[dict]:
+        """Solve the model 11 times across evenly spaced weight combinations and return results."""
         weight_pairs = [(round(1.0 - i * 0.1, 1), round(i * 0.1, 1)) for i in range(11)]
         results = []
 
-        for lp, lc in weight_pairs:
+        for i, (lp, lc) in enumerate(weight_pairs):
             self.lambda_profit = lp
             self.lambda_co2 = lc
             print(f"\nλ_profit={lp:.1f}, λ_co2={lc:.1f}")
             solved = self.solve()
-            profit, co2 = self._extract_objectives(solved)
+            profit, co2, breakdown = self._extract_objectives(solved)
             results.append(
                 {"lambda_profit": lp, "lambda_co2": lc, "profit": profit, "co2": co2}
             )
+            if i == 0:
+                self.visualize_profit_distribution(breakdown, lp, lc)
 
         return results
 

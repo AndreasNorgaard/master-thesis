@@ -281,7 +281,7 @@ class Model2:
 
         return model
 
-    def _extract_objectives(self, model) -> tuple[float, float]:
+    def _extract_objectives(self, model) -> tuple[float, float, dict]:
         """Extract actual (unweighted) profit and CO2 from a solved model, printing a breakdown."""
         Q = len(self.df)
         da_sell_vals = [pyo.value(model.da_sell[q]) for q in range(1, Q + 1)]
@@ -319,22 +319,81 @@ class Model2:
         print(f"  Net Profit:          {profit:>10.2f} DKK")
         print(f"  CO2 Emissions:       {co2:>10.4f} kg")
 
-        return profit, co2
+        breakdown = {
+            "da_revenue": da_revenue,
+            "prod_tariff": -prod_tariff,
+            "da_cost": -da_cost,
+            "cons_tariff": -cons_tariff,
+            "degradation": -degradation,
+            "profit": profit,
+            "co2": co2,
+        }
+        return profit, co2, breakdown
+
+    def visualize_profit_distribution(
+        self, breakdown: dict, lambda_profit: float, lambda_co2: float
+    ) -> None:
+        """Plot a waterfall chart of the profit breakdown for one weight pair."""
+        labels = [
+            "Day-ahead Revenue",
+            "Production Tariffs",
+            "Day-ahead Cost",
+            "Consumption Tariffs",
+            "Degradation Cost",
+            "Profit",
+        ]
+        values = [
+            breakdown["da_revenue"],
+            breakdown["prod_tariff"],
+            breakdown["da_cost"],
+            breakdown["cons_tariff"],
+            breakdown["degradation"],
+            None,
+        ]
+        measures = ["relative", "relative", "relative", "relative", "relative", "total"]
+
+        fig = go.Figure(
+            go.Waterfall(
+                orientation="v",
+                measure=measures,
+                x=labels,
+                y=values,
+                text=[
+                    f"{v:.2f}" if v is not None else f"{breakdown['profit']:.2f}"
+                    for v in values
+                ],
+                textposition="outside",
+                increasing={"marker": {"color": "green"}},
+                decreasing={"marker": {"color": "red"}},
+                totals={"marker": {"color": "steelblue"}},
+                connector={"line": {"color": "grey", "width": 1}},
+            )
+        )
+        fig.update_layout(
+            title=f"Profit Distribution - Model 2 (λ_profit={lambda_profit}, λ_co2={lambda_co2})",
+            yaxis_title="DKK",
+            plot_bgcolor="aliceblue",
+            showlegend=False,
+        )
+        fig.show()
+        fig.write_image(f"results/model_2_profit_lp{lambda_profit}_lc{lambda_co2}.png")
 
     def pareto_frontier(self) -> list[dict]:
         """Solve the model 11 times across evenly spaced weight combinations and return results."""
         weight_pairs = [(round(1.0 - i * 0.1, 1), round(i * 0.1, 1)) for i in range(11)]
         results = []
 
-        for lp, lc in weight_pairs:
+        for i, (lp, lc) in enumerate(weight_pairs):
             self.lambda_profit = lp
             self.lambda_co2 = lc
             print(f"\nλ_profit={lp:.1f}, λ_co2={lc:.1f}")
             solved = self.solve()
-            profit, co2 = self._extract_objectives(solved)
+            profit, co2, breakdown = self._extract_objectives(solved)
             results.append(
                 {"lambda_profit": lp, "lambda_co2": lc, "profit": profit, "co2": co2}
             )
+            if i == 0:
+                self.visualize_profit_distribution(breakdown, lp, lc)
 
         return results
 
