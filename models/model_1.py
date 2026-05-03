@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import holidays
 import plotly.graph_objects as go
 import polars as pl
@@ -42,7 +44,7 @@ class Model1:
         # Load data
         self.load_data()
 
-    def load_data(self):
+    def load_data(self, write_to_file: bool = True):
         df_quarters = EnergiDataServiceAPIClient(
             start_date=self.start_date,
             end_date=self.end_date,
@@ -94,6 +96,10 @@ class Model1:
         )
 
         self.df = df_quarters
+        if write_to_file:
+            out = Path("data/prepared/model_1.xlsx")
+            out.parent.mkdir(parents=True, exist_ok=True)
+            self.df.write_excel(out)
 
     def equation_1(self, model):
         """

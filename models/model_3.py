@@ -1,7 +1,10 @@
+from pathlib import Path
+
 import holidays
 import plotly.graph_objects as go
 import polars as pl
 import pyomo.environ as pyo
+import xlsxwriter
 
 from data.energi_data_service import EnergiDataServiceAPIClient
 
@@ -53,7 +56,7 @@ class Model3:
         # Load data
         self.load_data()
 
-    def load_data(self):
+    def load_data(self, write_to_file: bool = True):
         client = EnergiDataServiceAPIClient(
             start_date=self.start_date,
             end_date=self.end_date,
@@ -68,6 +71,14 @@ class Model3:
         self.df, self.df_hourly, self.df_block = self.create_dataset(
             df_da, df_co2, df_ffr, df_fcr_nd, df_afrr, df_mfrr
         )
+        if write_to_file:
+            out = Path("data/prepared/model_3.xlsx")
+            out.parent.mkdir(parents=True, exist_ok=True)
+            wb = xlsxwriter.Workbook(str(out))
+            self.df.write_excel(wb, worksheet="quarterly")
+            self.df_hourly.write_excel(wb, worksheet="hourly")
+            self.df_block.write_excel(wb, worksheet="blocks")
+            wb.close()
 
     def create_dataset(
         self,

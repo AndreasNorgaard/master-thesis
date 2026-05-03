@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import holidays
 import plotly.graph_objects as go
 import polars as pl
@@ -51,7 +53,7 @@ class Model2:
         # Load data
         self.load_data()
 
-    def load_data(self):
+    def load_data(self, write_to_file: bool = True):
         client = EnergiDataServiceAPIClient(
             start_date=self.start_date,
             end_date=self.end_date,
@@ -60,6 +62,10 @@ class Model2:
         df_da = client.day_ahead_prices(write_to_file=False)
         df_co2 = client.co2_emissions(write_to_file=False)
         self.df = self.create_dataset(df_da, df_co2)
+        if write_to_file:
+            out = Path("data/prepared/model_2.xlsx")
+            out.parent.mkdir(parents=True, exist_ok=True)
+            self.df.write_excel(out)
 
     def create_dataset(self, df_da: pl.DataFrame, df_co2: pl.DataFrame) -> pl.DataFrame:
         """
