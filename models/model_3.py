@@ -780,7 +780,7 @@ class Model3:
             showlegend=False,
         )
         fig.show()
-        fig.write_image(f"results/model_3_profit_lp{lambda_profit}_lc{lambda_co2}.png")
+        fig.write_image("results/model_3_profit.png")
 
     def pareto_frontier(self) -> list[dict]:
         """Solve the model 11 times across evenly spaced weight combinations and return results."""
