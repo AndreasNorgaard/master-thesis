@@ -28,6 +28,9 @@ python -m models.model_1
 
 # Run Model 2 (multi-objective: profit + CO2)
 python -m models.model_2
+
+# Run Model 2 (extended multi-objective: profit + CO2)
+python -m models.model_3
 ```
 
 ## Common Commands
