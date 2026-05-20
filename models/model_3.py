@@ -5,6 +5,7 @@ import plotly.graph_objects as go
 import polars as pl
 import pyomo.environ as pyo
 import xlsxwriter
+from plotly.subplots import make_subplots
 
 from data.energi_data_service import EnergiDataServiceAPIClient
 
@@ -18,8 +19,8 @@ class Model3:
         self,
         start_date: str,
         end_date: str,
-        lambda_profit: float = 0.5,
-        lambda_co2: float = 0.5,
+        bat_mw: float = 2,
+        bat_mwh: float = 4,
     ):
         self.results_file_path = "results/model_3.xlsx"
 
@@ -28,8 +29,8 @@ class Model3:
         self.end_date = end_date
 
         # Set BESS configuration
-        self.bat_mw = 2  # Max charging/discharging power (MW)
-        self.bat_mwh = 4  # Energy storage capacity (MWh)
+        self.bat_mw = bat_mw  # Max charging/discharging power (MW)
+        self.bat_mwh = bat_mwh  # Energy storage capacity (MWh)
         self.bat_charge_eff = 0.99  # Charging efficiency (η_c)
         self.bat_discharge_eff = 0.87  # Discharging efficiency (η_d)
         self.soc_initial = 0.50  # Initial state of charge (fraction of bat_mwh)
@@ -48,10 +49,6 @@ class Model3:
         self.E_FCRN = 1.0
         self.E_aFRR = 4.0
         self.E_mFRR = 0.25  # 15 minutes
-
-        # Multi-objective weights (must sum to 1)
-        self.lambda_profit = lambda_profit
-        self.lambda_co2 = lambda_co2
 
         # Load data
         self.load_data()
@@ -178,11 +175,21 @@ class Model3:
         else:
             df_hours = df_hours.with_columns(pl.lit(0.0).alias("P_FFR"))
 
-        # FCR-N/D: pivot to one column per product, take AuctionType = "Total"
+        # FCR-N/D: pivot to one column per (product, auction).
+        # Auctions: "D-1 early" (E) and "D-1 late" (L).
+        fcr_cols = [
+            "P_FCRD_up_E",
+            "P_FCRD_up_L",
+            "P_FCRD_down_E",
+            "P_FCRD_down_L",
+            "P_FCRN_E",
+            "P_FCRN_L",
+        ]
         if df_fcr_nd.height > 0:
             fcr = (
                 df_fcr_nd.filter(
-                    (pl.col("PriceArea") == "DK2") & (pl.col("AuctionType") == "Total")
+                    (pl.col("PriceArea") == "DK2")
+                    & (pl.col("AuctionType").is_in(["D-1 early", "D-1 late"]))
                 )
                 .with_columns(
                     pl.col("HourUTC").str.to_datetime(
@@ -191,31 +198,38 @@ class Model3:
                     (pl.col("PriceTotalEUR").cast(pl.Float64) * self.EUR_TO_DKK).alias(
                         "PriceDKK"
                     ),
+                    pl.when(pl.col("AuctionType") == "D-1 early")
+                    .then(pl.lit("E"))
+                    .otherwise(pl.lit("L"))
+                    .alias("AuctionTag"),
                 )
-                .select(["HourUTC", "ProductName", "PriceDKK"])
-                .pivot(values="PriceDKK", index="HourUTC", on="ProductName")
+                .with_columns(
+                    (pl.col("ProductName") + "__" + pl.col("AuctionTag")).alias("Key")
+                )
+                .select(["HourUTC", "Key", "PriceDKK"])
+                .pivot(values="PriceDKK", index="HourUTC", on="Key")
                 .rename({"HourUTC": "TimeUTC"})
             )
-            for src, dst in [
-                ("FCR-D upp", "P_FCRD_up"),
-                ("FCR-D ned", "P_FCRD_down"),
-                ("FCR-N", "P_FCRN"),
-            ]:
+            rename_map = {
+                "FCR-D upp__E": "P_FCRD_up_E",
+                "FCR-D upp__L": "P_FCRD_up_L",
+                "FCR-D ned__E": "P_FCRD_down_E",
+                "FCR-D ned__L": "P_FCRD_down_L",
+                "FCR-N__E": "P_FCRN_E",
+                "FCR-N__L": "P_FCRN_L",
+            }
+            for src, dst in rename_map.items():
                 if src in fcr.columns:
                     fcr = fcr.rename({src: dst})
                 else:
                     fcr = fcr.with_columns(pl.lit(0.0).alias(dst))
             df_hours = df_hours.join(
-                fcr.select(["TimeUTC", "P_FCRD_up", "P_FCRD_down", "P_FCRN"]),
+                fcr.select(["TimeUTC", *fcr_cols]),
                 on="TimeUTC",
                 how="left",
             )
         else:
-            df_hours = df_hours.with_columns(
-                pl.lit(0.0).alias("P_FCRD_up"),
-                pl.lit(0.0).alias("P_FCRD_down"),
-                pl.lit(0.0).alias("P_FCRN"),
-            )
+            df_hours = df_hours.with_columns(*[pl.lit(0.0).alias(c) for c in fcr_cols])
 
         # mFRR (hourly, DKK prices)
         if df_mfrr.height > 0:
@@ -238,9 +252,7 @@ class Model3:
         # Fill gaps with 0 (no clearing -> zero revenue, never blocks bidding)
         for col in [
             "P_FFR",
-            "P_FCRD_up",
-            "P_FCRD_down",
-            "P_FCRN",
+            *fcr_cols,
             "P_mFRR_up",
             "P_mFRR_down",
         ]:
@@ -314,9 +326,12 @@ class Model3:
         )
         hourly_rev = sum(
             model.ffr[h] * model.p_ffr[h]
-            + model.fcrd_up[h] * model.p_fcrd_up[h]
-            + model.fcrd_down[h] * model.p_fcrd_down[h]
-            + model.fcrn[h] * model.p_fcrn[h]
+            + model.fcrd_up_E[h] * model.p_fcrd_up_E[h]
+            + model.fcrd_up_L[h] * model.p_fcrd_up_L[h]
+            + model.fcrd_down_E[h] * model.p_fcrd_down_E[h]
+            + model.fcrd_down_L[h] * model.p_fcrd_down_L[h]
+            + model.fcrn_E[h] * model.p_fcrn_E[h]
+            + model.fcrn_L[h] * model.p_fcrn_L[h]
             + model.mfrr_up[h] * model.p_mfrr_up[h]
             + model.mfrr_down[h] * model.p_mfrr_down[h]
             for h in model.hours
@@ -385,48 +400,48 @@ class Model3:
     # ----------------- New Model 3 constraints -----------------
 
     def equation_ler_fcrd_up(self, model, q):
-        """LER buffer with FCR-D up + aFRR up + mFRR up."""
+        """LER buffer with FCR-D up (E+L) + aFRR up + mFRR up."""
         h = self.quarter_to_hour(q)
         b = self.quarter_to_block(q)
         return (
             model.soc_min
-            + model.fcrd_up[h] * self.E_FCRD
+            + (model.fcrd_up_E[h] + model.fcrd_up_L[h]) * self.E_FCRD
             + model.afrr_up[b] * self.E_aFRR
             + model.mfrr_up[h] * self.E_mFRR
             <= model.soc[q]
         )
 
     def equation_ler_fcrd_down(self, model, q):
-        """LER buffer with FCR-D down + aFRR down + mFRR down."""
+        """LER buffer with FCR-D down (E+L) + aFRR down + mFRR down."""
         h = self.quarter_to_hour(q)
         b = self.quarter_to_block(q)
         return (
             model.soc_max
-            - model.fcrd_down[h] * self.E_FCRD
+            - (model.fcrd_down_E[h] + model.fcrd_down_L[h]) * self.E_FCRD
             - model.afrr_down[b] * self.E_aFRR
             - model.mfrr_down[h] * self.E_mFRR
             >= model.soc[q]
         )
 
     def equation_ler_fcrn_up(self, model, q):
-        """LER buffer with FCR-N + aFRR up + mFRR up."""
+        """LER buffer with FCR-N (E+L) + aFRR up + mFRR up."""
         h = self.quarter_to_hour(q)
         b = self.quarter_to_block(q)
         return (
             model.soc_min
-            + model.fcrn[h] * self.E_FCRN
+            + (model.fcrn_E[h] + model.fcrn_L[h]) * self.E_FCRN
             + model.afrr_up[b] * self.E_aFRR
             + model.mfrr_up[h] * self.E_mFRR
             <= model.soc[q]
         )
 
     def equation_ler_fcrn_down(self, model, q):
-        """LER buffer with FCR-N + aFRR down + mFRR down."""
+        """LER buffer with FCR-N (E+L) + aFRR down + mFRR down."""
         h = self.quarter_to_hour(q)
         b = self.quarter_to_block(q)
         return (
             model.soc_max
-            - model.fcrn[h] * self.E_FCRN
+            - (model.fcrn_E[h] + model.fcrn_L[h]) * self.E_FCRN
             - model.afrr_down[b] * self.E_aFRR
             - model.mfrr_down[h] * self.E_mFRR
             >= model.soc[q]
@@ -438,8 +453,10 @@ class Model3:
         return (
             model.da_sell[q]
             + model.ffr[h]
-            + model.fcrd_up[h]
-            + model.fcrn[h]
+            + model.fcrd_up_E[h]
+            + model.fcrd_up_L[h]
+            + model.fcrn_E[h]
+            + model.fcrn_L[h]
             + model.afrr_up[b]
             + model.mfrr_up[h]
             <= model.bat_discharge_eff * model.bat_mw
@@ -450,8 +467,10 @@ class Model3:
         b = self.quarter_to_block(q)
         return (
             model.da_buy[q]
-            + model.fcrd_down[h]
-            + model.fcrn[h]
+            + model.fcrd_down_E[h]
+            + model.fcrd_down_L[h]
+            + model.fcrn_E[h]
+            + model.fcrn_L[h]
             + model.afrr_down[b]
             + model.mfrr_down[h]
             <= model.bat_mw
@@ -512,16 +531,29 @@ class Model3:
         model.p_ffr = pyo.Param(
             model.hours, initialize={h: _hourly("P_FFR", h) for h in range(1, H + 1)}
         )
-        model.p_fcrd_up = pyo.Param(
+        model.p_fcrd_up_E = pyo.Param(
             model.hours,
-            initialize={h: _hourly("P_FCRD_up", h) for h in range(1, H + 1)},
+            initialize={h: _hourly("P_FCRD_up_E", h) for h in range(1, H + 1)},
         )
-        model.p_fcrd_down = pyo.Param(
+        model.p_fcrd_up_L = pyo.Param(
             model.hours,
-            initialize={h: _hourly("P_FCRD_down", h) for h in range(1, H + 1)},
+            initialize={h: _hourly("P_FCRD_up_L", h) for h in range(1, H + 1)},
         )
-        model.p_fcrn = pyo.Param(
-            model.hours, initialize={h: _hourly("P_FCRN", h) for h in range(1, H + 1)}
+        model.p_fcrd_down_E = pyo.Param(
+            model.hours,
+            initialize={h: _hourly("P_FCRD_down_E", h) for h in range(1, H + 1)},
+        )
+        model.p_fcrd_down_L = pyo.Param(
+            model.hours,
+            initialize={h: _hourly("P_FCRD_down_L", h) for h in range(1, H + 1)},
+        )
+        model.p_fcrn_E = pyo.Param(
+            model.hours,
+            initialize={h: _hourly("P_FCRN_E", h) for h in range(1, H + 1)},
+        )
+        model.p_fcrn_L = pyo.Param(
+            model.hours,
+            initialize={h: _hourly("P_FCRN_L", h) for h in range(1, H + 1)},
         )
         model.p_mfrr_up = pyo.Param(
             model.hours,
@@ -557,9 +589,12 @@ class Model3:
         model.soc = pyo.Var(model.quarters, bounds=self.equation_4)
 
         model.ffr = pyo.Var(model.hours, bounds=(0, None))
-        model.fcrd_up = pyo.Var(model.hours, bounds=(0, None))
-        model.fcrd_down = pyo.Var(model.hours, bounds=(0, None))
-        model.fcrn = pyo.Var(model.hours, bounds=(0, None))
+        model.fcrd_up_E = pyo.Var(model.hours, bounds=(0, None))
+        model.fcrd_up_L = pyo.Var(model.hours, bounds=(0, None))
+        model.fcrd_down_E = pyo.Var(model.hours, bounds=(0, None))
+        model.fcrd_down_L = pyo.Var(model.hours, bounds=(0, None))
+        model.fcrn_E = pyo.Var(model.hours, bounds=(0, None))
+        model.fcrn_L = pyo.Var(model.hours, bounds=(0, None))
         model.mfrr_up = pyo.Var(model.hours, bounds=(0, None))
         model.mfrr_down = pyo.Var(model.hours, bounds=(0, None))
         model.afrr_up = pyo.Var(model.blocks, bounds=(0, None))
@@ -628,16 +663,28 @@ class Model3:
         ffr_rev = sum(
             pyo.value(model.ffr[h]) * pyo.value(model.p_ffr[h]) for h in range(1, H + 1)
         )
-        fcrd_up_rev = sum(
-            pyo.value(model.fcrd_up[h]) * pyo.value(model.p_fcrd_up[h])
+        fcrd_up_E_rev = sum(
+            pyo.value(model.fcrd_up_E[h]) * pyo.value(model.p_fcrd_up_E[h])
             for h in range(1, H + 1)
         )
-        fcrd_down_rev = sum(
-            pyo.value(model.fcrd_down[h]) * pyo.value(model.p_fcrd_down[h])
+        fcrd_up_L_rev = sum(
+            pyo.value(model.fcrd_up_L[h]) * pyo.value(model.p_fcrd_up_L[h])
             for h in range(1, H + 1)
         )
-        fcrn_rev = sum(
-            pyo.value(model.fcrn[h]) * pyo.value(model.p_fcrn[h])
+        fcrd_down_E_rev = sum(
+            pyo.value(model.fcrd_down_E[h]) * pyo.value(model.p_fcrd_down_E[h])
+            for h in range(1, H + 1)
+        )
+        fcrd_down_L_rev = sum(
+            pyo.value(model.fcrd_down_L[h]) * pyo.value(model.p_fcrd_down_L[h])
+            for h in range(1, H + 1)
+        )
+        fcrn_E_rev = sum(
+            pyo.value(model.fcrn_E[h]) * pyo.value(model.p_fcrn_E[h])
+            for h in range(1, H + 1)
+        )
+        fcrn_L_rev = sum(
+            pyo.value(model.fcrn_L[h]) * pyo.value(model.p_fcrn_L[h])
             for h in range(1, H + 1)
         )
         mfrr_up_rev = sum(
@@ -658,9 +705,12 @@ class Model3:
         )
         reserve_rev = (
             ffr_rev
-            + fcrd_up_rev
-            + fcrd_down_rev
-            + fcrn_rev
+            + fcrd_up_E_rev
+            + fcrd_up_L_rev
+            + fcrd_down_E_rev
+            + fcrd_down_L_rev
+            + fcrn_E_rev
+            + fcrn_L_rev
             + mfrr_up_rev
             + mfrr_down_rev
             + afrr_up_rev
@@ -676,23 +726,26 @@ class Model3:
             for q in model.quarters
         )
 
-        print(f"  Day-ahead Revenue:   {da_revenue:>12.2f} DKK")
-        print(f"  Production Tariffs:  {-prod_tariff:>12.2f} DKK")
-        print(f"  Day-ahead Cost:      {-da_cost:>12.2f} DKK")
-        print(f"  Consumption Tariffs: {-cons_tariff:>12.2f} DKK")
-        print(f"  Degradation Cost:    {-degradation:>12.2f} DKK")
-        print(f"  DA Net Profit:       {da_profit:>12.2f} DKK")
-        print(f"  FFR Revenue:         {ffr_rev:>12.2f} DKK")
-        print(f"  FCR-D up Revenue:    {fcrd_up_rev:>12.2f} DKK")
-        print(f"  FCR-D down Revenue:  {fcrd_down_rev:>12.2f} DKK")
-        print(f"  FCR-N Revenue:       {fcrn_rev:>12.2f} DKK")
-        print(f"  aFRR up Revenue:     {afrr_up_rev:>12.2f} DKK")
-        print(f"  aFRR down Revenue:   {afrr_down_rev:>12.2f} DKK")
-        print(f"  mFRR up Revenue:     {mfrr_up_rev:>12.2f} DKK")
-        print(f"  mFRR down Revenue:   {mfrr_down_rev:>12.2f} DKK")
-        print(f"  Reserve Revenue:     {reserve_rev:>12.2f} DKK")
-        print(f"  Total Profit:        {profit:>12.2f} DKK")
-        print(f"  CO2 Emissions:       {co2:>12.4f} kg")
+        # print(f"  Day-ahead Revenue:   {da_revenue:>12.2f} DKK")
+        # print(f"  Production Tariffs:  {-prod_tariff:>12.2f} DKK")
+        # print(f"  Day-ahead Cost:      {-da_cost:>12.2f} DKK")
+        # print(f"  Consumption Tariffs: {-cons_tariff:>12.2f} DKK")
+        # print(f"  Degradation Cost:    {-degradation:>12.2f} DKK")
+        # print(f"  DA Net Profit:       {da_profit:>12.2f} DKK")
+        # print(f"  FFR Revenue:           {ffr_rev:>12.2f} DKK")
+        # print(f"  FCR-D up early Rev:    {fcrd_up_E_rev:>12.2f} DKK")
+        # print(f"  FCR-D up late Rev:     {fcrd_up_L_rev:>12.2f} DKK")
+        # print(f"  FCR-D down early Rev:  {fcrd_down_E_rev:>12.2f} DKK")
+        # print(f"  FCR-D down late Rev:   {fcrd_down_L_rev:>12.2f} DKK")
+        # print(f"  FCR-N early Revenue:   {fcrn_E_rev:>12.2f} DKK")
+        # print(f"  FCR-N late Revenue:    {fcrn_L_rev:>12.2f} DKK")
+        # print(f"  aFRR up Revenue:       {afrr_up_rev:>12.2f} DKK")
+        # print(f"  aFRR down Revenue:     {afrr_down_rev:>12.2f} DKK")
+        # print(f"  mFRR up Revenue:       {mfrr_up_rev:>12.2f} DKK")
+        # print(f"  mFRR down Revenue:     {mfrr_down_rev:>12.2f} DKK")
+        # print(f"  Reserve Revenue:       {reserve_rev:>12.2f} DKK")
+        print(f"  Total Profit:          {profit:>12.2f} DKK")
+        print(f"  CO2 Emissions:         {co2:>12.4f} kg")
 
         breakdown = {
             "da_revenue": da_revenue,
@@ -702,9 +755,12 @@ class Model3:
             "degradation": -degradation,
             "da_profit": da_profit,
             "ffr_revenue": ffr_rev,
-            "fcrd_up_revenue": fcrd_up_rev,
-            "fcrd_down_revenue": fcrd_down_rev,
-            "fcrn_revenue": fcrn_rev,
+            "fcrd_up_E_revenue": fcrd_up_E_rev,
+            "fcrd_up_L_revenue": fcrd_up_L_rev,
+            "fcrd_down_E_revenue": fcrd_down_E_rev,
+            "fcrd_down_L_revenue": fcrd_down_L_rev,
+            "fcrn_E_revenue": fcrn_E_rev,
+            "fcrn_L_revenue": fcrn_L_rev,
             "afrr_up_revenue": afrr_up_rev,
             "afrr_down_revenue": afrr_down_rev,
             "mfrr_up_revenue": mfrr_up_rev,
@@ -729,9 +785,12 @@ class Model3:
             "Consumption Tariffs",
             "Degradation Cost",
             "FFR Revenue",
-            "FCR-D up Revenue",
-            "FCR-D down Revenue",
-            "FCR-N Revenue",
+            "FCR-D up early Revenue",
+            "FCR-D up late Revenue",
+            "FCR-D down early Revenue",
+            "FCR-D down late Revenue",
+            "FCR-N early Revenue",
+            "FCR-N late Revenue",
             "aFRR up Revenue",
             "aFRR down Revenue",
             "mFRR up Revenue",
@@ -745,9 +804,12 @@ class Model3:
             breakdown["cons_tariff"],
             breakdown["degradation"],
             breakdown["ffr_revenue"],
-            breakdown["fcrd_up_revenue"],
-            breakdown["fcrd_down_revenue"],
-            breakdown["fcrn_revenue"],
+            breakdown["fcrd_up_E_revenue"],
+            breakdown["fcrd_up_L_revenue"],
+            breakdown["fcrd_down_E_revenue"],
+            breakdown["fcrd_down_L_revenue"],
+            breakdown["fcrn_E_revenue"],
+            breakdown["fcrn_L_revenue"],
             breakdown["afrr_up_revenue"],
             breakdown["afrr_down_revenue"],
             breakdown["mfrr_up_revenue"],
@@ -774,23 +836,156 @@ class Model3:
             )
         )
         fig.update_layout(
-            title=f"Profit Distribution - Model 3 (λ_profit={lambda_profit}, λ_co2={lambda_co2})",
             yaxis_title="DKK",
             plot_bgcolor="aliceblue",
             showlegend=False,
+            margin=dict(l=0, r=0, t=20, b=10),
         )
         fig.show()
         fig.write_image("results/model_3_profit.png")
 
+    def visualize_schedule(self, model) -> None:
+        """Stacked production schedule: DA + all capacity-auction allocations + SoC."""
+        Q = len(self.df)
+        times = self.df["TimeDK"].to_list()
+
+        def q_to_h(q: int) -> int:
+            return (q - 1) // 4 + 1
+
+        def q_to_b(q: int) -> int:
+            return (q - 1) // 16 + 1
+
+        soc = [pyo.value(model.soc[q]) / self.bat_mwh for q in range(1, Q + 1)]
+
+        # Day-ahead (quarterly) — sign convention: charge positive, discharge negative
+        da_buy = [pyo.value(model.da_buy[q]) for q in range(1, Q + 1)]
+        da_sell = [-pyo.value(model.da_sell[q]) for q in range(1, Q + 1)]
+
+        # Broadcast hourly reserves to quarterly index
+        def hourly_q(var):
+            return [pyo.value(var[q_to_h(q)]) for q in range(1, Q + 1)]
+
+        def block_q(var):
+            return [pyo.value(var[q_to_b(q)]) for q in range(1, Q + 1)]
+
+        # Discharge-direction (negative bars)
+        ffr_q = [-v for v in hourly_q(model.ffr)]
+        fcrd_up_E_q = [-v for v in hourly_q(model.fcrd_up_E)]
+        fcrd_up_L_q = [-v for v in hourly_q(model.fcrd_up_L)]
+        fcrn_E_up_q = [-v for v in hourly_q(model.fcrn_E)]
+        fcrn_L_up_q = [-v for v in hourly_q(model.fcrn_L)]
+        mfrr_up_q = [-v for v in hourly_q(model.mfrr_up)]
+        afrr_up_q = [-v for v in block_q(model.afrr_up)]
+
+        # Charge-direction (positive bars)
+        fcrd_down_E_q = hourly_q(model.fcrd_down_E)
+        fcrd_down_L_q = hourly_q(model.fcrd_down_L)
+        fcrn_E_down_q = hourly_q(model.fcrn_E)
+        fcrn_L_down_q = hourly_q(model.fcrn_L)
+        mfrr_down_q = hourly_q(model.mfrr_down)
+        afrr_down_q = block_q(model.afrr_down)
+
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+        soc_min_frac = self.soc_min / self.bat_mwh
+        soc_max_frac = self.soc_max / self.bat_mwh
+        fig.add_hrect(
+            y0=soc_min_frac,
+            y1=soc_max_frac,
+            fillcolor="steelblue",
+            opacity=0.10,
+            layer="below",
+            line_width=0,
+            secondary_y=False,
+        )
+
+        # Color palette — one hue per product family, shades per auction/direction
+        discharge_traces = [
+            ("Day-ahead sell", da_sell, "#525252"),
+            ("FFR", ffr_q, "#d73027"),
+            ("FCR-D up (early)", fcrd_up_E_q, "#f4a582"),
+            ("FCR-D up (late)", fcrd_up_L_q, "#d6604d"),
+            ("FCR-N up (early)", fcrn_E_up_q, "#fee08b"),
+            ("FCR-N up (late)", fcrn_L_up_q, "#fdae61"),
+            ("aFRR up", afrr_up_q, "#762a83"),
+            ("mFRR up", mfrr_up_q, "#1b7837"),
+        ]
+        charge_traces = [
+            ("Day-ahead buy", da_buy, "#969696"),
+            ("FCR-D down (early)", fcrd_down_E_q, "#fdb863"),
+            ("FCR-D down (late)", fcrd_down_L_q, "#e08214"),
+            ("FCR-N down (early)", fcrn_E_down_q, "#ffffbf"),
+            ("FCR-N down (late)", fcrn_L_down_q, "#fee090"),
+            ("aFRR down", afrr_down_q, "#9970ab"),
+            ("mFRR down", mfrr_down_q, "#7fbc41"),
+        ]
+
+        for name, y, color in discharge_traces + charge_traces:
+            fig.add_trace(
+                go.Bar(
+                    x=times,
+                    y=y,
+                    name=name,
+                    marker_color=color,
+                    marker_line_width=0,
+                    opacity=0.65,
+                ),
+                secondary_y=True,
+            )
+
+        fig.add_trace(
+            go.Scatter(
+                x=times,
+                y=soc,
+                name="State of Charge",
+                mode="lines",
+                line=dict(color="black", width=2.5),
+                cliponaxis=False,
+            ),
+            secondary_y=False,
+        )
+
+        fig.update_layout(
+            barmode="relative",
+            plot_bgcolor="white",
+            legend=dict(
+                orientation="h",
+                yanchor="top",
+                y=-0.05,
+                xanchor="center",
+                x=0.5,
+            ),
+            xaxis=dict(showgrid=False),
+            margin=dict(l=0, r=0, t=20, b=10),
+        )
+        fig.update_yaxes(
+            title_text="SoC [%]",
+            range=[0, 1],
+            secondary_y=False,
+            showgrid=True,
+            gridcolor="lightgrey",
+        )
+        fig.update_yaxes(
+            title_text="Effect [MW]",
+            range=[-(self.bat_mw + 0.2), self.bat_mw + 0.2],
+            secondary_y=True,
+            showgrid=False,
+        )
+
+        fig.show()
+        fig.write_image("results/model_3_schedule.png")
+
     def pareto_frontier(self) -> list[dict]:
-        """Solve the model 11 times across evenly spaced weight combinations and return results."""
-        weight_pairs = [(round(1.0 - i * 0.1, 1), round(i * 0.1, 1)) for i in range(11)]
+        """Solve the model 101 times across evenly spaced weight combinations and return results."""
+        weight_pairs = [
+            (round(1.0 - i * 0.01, 2), round(i * 0.01, 2)) for i in range(101)
+        ]
         results = []
 
         for i, (lp, lc) in enumerate(weight_pairs):
             self.lambda_profit = lp
             self.lambda_co2 = lc
-            print(f"\nλ_profit={lp:.1f}, λ_co2={lc:.1f}")
+            print(f"\nλ_profit={lp:.2f}, λ_co2={lc:.2f}")
             solved = self.solve()
             profit, co2, breakdown = self._extract_objectives(solved)
             results.append(
@@ -798,17 +993,60 @@ class Model3:
             )
             if i == 0:
                 self.visualize_profit_distribution(breakdown, lp, lc)
+                self.visualize_schedule(solved)
 
         return results
+
+    def save_results(self, results: list[dict]):
+        """Save pareto frontier results (weights, profit, CO2) to an Excel file."""
+        out = Path(self.results_file_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        df = pl.DataFrame(
+            {
+                "lambda_profit": [r["lambda_profit"] for r in results],
+                "lambda_co2": [r["lambda_co2"] for r in results],
+                "profit_dkk": [r["profit"] for r in results],
+                "co2_kg": [r["co2"] for r in results],
+            }
+        )
+        df.write_excel(out)
+        print(f"\nResults saved to {out}")
 
     def visualize_pareto_frontier(self, results: list[dict]):
         profits = [r["profit"] for r in results]
         co2s = [r["co2"] for r in results]
         labels = [
-            f"λ=({r['lambda_profit']:.1f}, {r['lambda_co2']:.1f})" for r in results
+            f"λ=({r['lambda_profit']:.2f}, {r['lambda_co2']:.2f})" for r in results
         ]
 
-        fig = go.Figure(
+        fig = go.Figure()
+
+        # Shaded region: profit > 0 and CO2 < 0
+        x_max = max(profits) * 1.05
+        y_min = min(co2s) * 1.05 if min(co2s) < 0 else -1
+        fig.add_shape(
+            type="rect",
+            xref="x",
+            yref="y",
+            x0=0,
+            x1=x_max,
+            y0=y_min,
+            y1=0,
+            fillcolor="rgba(0, 200, 100, 0.15)",
+            line_width=0,
+            layer="below",
+        )
+        fig.add_annotation(
+            x=x_max,
+            y=y_min,
+            text="Profit > 0 & CO₂ < 0",
+            showarrow=False,
+            font=dict(size=10, color="green"),
+            xanchor="right",
+            yanchor="bottom",
+        )
+
+        fig.add_trace(
             go.Scatter(
                 x=profits,
                 y=co2s,
@@ -821,10 +1059,10 @@ class Model3:
             )
         )
         fig.update_layout(
-            title="Model 3 Pareto Frontier — Profit vs. CO₂ Emissions",
             xaxis_title="Profit (DKK)",
             yaxis_title="CO₂ Emissions (kg)",
             template="plotly_white",
+            margin=dict(l=0, r=0, t=20, b=10),
         )
         fig.show()
         fig.write_image("results/model_3_pareto_frontier.png")
@@ -836,4 +1074,5 @@ if __name__ == "__main__":
         end_date="2026-04-30",
     )
     pareto_results = m.pareto_frontier()
+    m.save_results(pareto_results)
     m.visualize_pareto_frontier(pareto_results)

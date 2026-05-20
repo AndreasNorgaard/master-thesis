@@ -13,8 +13,6 @@ class Model2:
         self,
         start_date: str,
         end_date: str,
-        lambda_profit: float = 0.5,
-        lambda_co2: float = 0.5,
     ):
         self.results_file_path = "results/model_2.xlsx"
 
@@ -45,10 +43,6 @@ class Model2:
         #   nettabstarif  = 1.42% × (P_spot_q + 26 DKK/MWh)
         #   DSO_q         = 30.4 DKK/MWh (00:00–06:00 weekdays and all weekends)
         #                 = 91.1 DKK/MWh (06:00–24:00 weekdays)
-
-        # Multi-objective weights (must sum to 1)
-        self.lambda_profit = lambda_profit
-        self.lambda_co2 = lambda_co2
 
         # Load data
         self.load_data()
@@ -311,20 +305,20 @@ class Model2:
             for q in model.quarters
         )
 
-        print(f"  Day-ahead Revenue:   {da_revenue:>10.2f} DKK")
-        print(f"  Production Tariffs:  {-prod_tariff:>10.2f} DKK")
-        print(f"  Day-ahead Cost:      {-da_cost:>10.2f} DKK")
-        print(f"  Consumption Tariffs: {-cons_tariff:>10.2f} DKK")
-        print(f"  Degradation Cost:    {-degradation:>10.2f} DKK")
+        # print(f"  Day-ahead Revenue:   {da_revenue:>10.2f} DKK")
+        # print(f"  Production Tariffs:  {-prod_tariff:>10.2f} DKK")
+        # print(f"  Day-ahead Cost:      {-da_cost:>10.2f} DKK")
+        # print(f"  Consumption Tariffs: {-cons_tariff:>10.2f} DKK")
+        # print(f"  Degradation Cost:    {-degradation:>10.2f} DKK")
         print(f"  Net Profit:          {profit:>10.2f} DKK")
         print(f"  CO2 Emissions:       {co2:>10.4f} kg")
 
         return profit, co2
 
     def pareto_frontier(self) -> list[dict]:
-        """Solve the model 11 times across evenly spaced weight combinations and return results."""
+        """Solve the model 101 times across evenly spaced weight combinations and return results."""
         weight_pairs = [
-            (round(1.0 - i * 0.02, 2), round(i * 0.02, 2)) for i in range(51)
+            (round(1.0 - i * 0.01, 2), round(i * 0.01, 2)) for i in range(101)
         ]
         results = []
 
@@ -339,6 +333,21 @@ class Model2:
             )
 
         return results
+
+    def save_results(self, results: list[dict]):
+        """Save pareto frontier results (weights, profit, CO2) to an Excel file."""
+        out = Path(self.results_file_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        df = pl.DataFrame(
+            {
+                "lambda_profit": [r["lambda_profit"] for r in results],
+                "lambda_co2": [r["lambda_co2"] for r in results],
+                "profit_dkk": [r["profit"] for r in results],
+                "co2_kg": [r["co2"] for r in results],
+            }
+        )
+        df.write_excel(out)
+        print(f"\nResults saved to {out}")
 
     def visualize_pareto_frontier(self, results: list[dict]):
         """Plot the Pareto frontier from the results of pareto_frontier()."""
@@ -403,4 +412,5 @@ if __name__ == "__main__":
         end_date="2026-04-30",
     )
     pareto_results = m.pareto_frontier()
+    m.save_results(pareto_results)
     m.visualize_pareto_frontier(pareto_results)
