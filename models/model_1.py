@@ -313,10 +313,10 @@ class Model1:
             )
         )
         fig.update_layout(
-            title="Profit Distribution - Model 1",
             yaxis_title="DKK",
             plot_bgcolor="aliceblue",
             showlegend=False,
+            margin=dict(l=0, r=0, t=20, b=10),
         )
         fig.show()
         fig.write_image("results/model_1_profit.png")
@@ -381,17 +381,17 @@ class Model1:
         )
 
         fig.update_layout(
-            title="Visualization of Production Schedule from Model 1",
             barmode="overlay",
             plot_bgcolor="white",
             legend=dict(
                 orientation="h",
                 yanchor="top",
-                y=-0.15,
+                y=-0.05,
                 xanchor="center",
                 x=0.5,
             ),
             xaxis=dict(showgrid=False),
+            margin=dict(l=0, r=0, t=20, b=10),
         )
         fig.update_yaxes(
             title_text="SoC [%]",
@@ -410,6 +410,81 @@ class Model1:
         fig.show()
         fig.write_image("results/model_1_schedule.png")
 
+    def visualize_schedule_with_price(self, model):
+        Q = len(self.df)
+        times = self.df["TimeDK"].to_list()
+
+        da_buy = [pyo.value(model.da_buy[q]) for q in range(1, Q + 1)]
+        da_sell = [-pyo.value(model.da_sell[q]) for q in range(1, Q + 1)]
+        da_price = self.df["DayAheadPriceDKK"].to_list()
+
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+        # Charging bars (positive, red)
+        fig.add_trace(
+            go.Bar(
+                x=times,
+                y=da_buy,
+                name="Day-ahead buy (Charge)",
+                marker_color="red",
+                opacity=0.85,
+            ),
+            secondary_y=True,
+        )
+
+        # Discharging bars (negative, green)
+        fig.add_trace(
+            go.Bar(
+                x=times,
+                y=da_sell,
+                name="Day-ahead sell (Discharge)",
+                marker_color="green",
+                opacity=0.85,
+            ),
+            secondary_y=True,
+        )
+
+        # Day-ahead price line
+        fig.add_trace(
+            go.Scatter(
+                x=times,
+                y=da_price,
+                name="Day-ahead price",
+                mode="lines",
+                line=dict(color="gray", width=1.5, dash="dot"),
+            ),
+            secondary_y=False,
+        )
+
+        fig.update_layout(
+            barmode="overlay",
+            plot_bgcolor="white",
+            legend=dict(
+                orientation="h",
+                yanchor="top",
+                y=-0.05,
+                xanchor="center",
+                x=0.5,
+            ),
+            xaxis=dict(showgrid=False, range=["2026-04-01", "2026-04-04"]),
+            margin=dict(l=0, r=0, t=20, b=10),
+        )
+        fig.update_yaxes(
+            title_text="Day-ahead price [DKK/MWh]",
+            showgrid=True,
+            gridcolor="lightgrey",
+            secondary_y=False,
+        )
+        fig.update_yaxes(
+            title_text="Effect [MW]",
+            range=[-(self.bat_mw + 0.2), self.bat_mw + 0.2],
+            showgrid=False,
+            secondary_y=True,
+        )
+
+        fig.show()
+        fig.write_image("results/model_1_schedule_with_price.png")
+
 
 if __name__ == "__main__":
     m = Model1(start_date="2026-04-01", end_date="2026-04-30")
@@ -417,3 +492,4 @@ if __name__ == "__main__":
     m.calculate_profit(solved)
     m.visualize_profit()
     m.visualize_schedule(solved)
+    m.visualize_schedule_with_price(solved)
