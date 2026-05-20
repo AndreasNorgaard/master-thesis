@@ -281,7 +281,7 @@ class Model2:
 
         return model
 
-    def _extract_objectives(self, model) -> tuple[float, float, dict]:
+    def _extract_objectives(self, model) -> tuple[float, float]:
         """Extract actual (unweighted) profit and CO2 from a solved model, printing a breakdown."""
         Q = len(self.df)
         da_sell_vals = [pyo.value(model.da_sell[q]) for q in range(1, Q + 1)]
@@ -319,81 +319,24 @@ class Model2:
         print(f"  Net Profit:          {profit:>10.2f} DKK")
         print(f"  CO2 Emissions:       {co2:>10.4f} kg")
 
-        breakdown = {
-            "da_revenue": da_revenue,
-            "prod_tariff": -prod_tariff,
-            "da_cost": -da_cost,
-            "cons_tariff": -cons_tariff,
-            "degradation": -degradation,
-            "profit": profit,
-            "co2": co2,
-        }
-        return profit, co2, breakdown
-
-    def visualize_profit_distribution(
-        self, breakdown: dict, lambda_profit: float, lambda_co2: float
-    ) -> None:
-        """Plot a waterfall chart of the profit breakdown for one weight pair."""
-        labels = [
-            "Day-ahead Revenue",
-            "Production Tariffs",
-            "Day-ahead Cost",
-            "Consumption Tariffs",
-            "Degradation Cost",
-            "Profit",
-        ]
-        values = [
-            breakdown["da_revenue"],
-            breakdown["prod_tariff"],
-            breakdown["da_cost"],
-            breakdown["cons_tariff"],
-            breakdown["degradation"],
-            None,
-        ]
-        measures = ["relative", "relative", "relative", "relative", "relative", "total"]
-
-        fig = go.Figure(
-            go.Waterfall(
-                orientation="v",
-                measure=measures,
-                x=labels,
-                y=values,
-                text=[
-                    f"{v:.2f}" if v is not None else f"{breakdown['profit']:.2f}"
-                    for v in values
-                ],
-                textposition="outside",
-                increasing={"marker": {"color": "green"}},
-                decreasing={"marker": {"color": "red"}},
-                totals={"marker": {"color": "steelblue"}},
-                connector={"line": {"color": "grey", "width": 1}},
-            )
-        )
-        fig.update_layout(
-            title=f"Profit Distribution - Model 2 (λ_profit={lambda_profit}, λ_co2={lambda_co2})",
-            yaxis_title="DKK",
-            plot_bgcolor="aliceblue",
-            showlegend=False,
-        )
-        fig.show()
-        fig.write_image(f"results/model_2_profit_lp{lambda_profit}_lc{lambda_co2}.png")
+        return profit, co2
 
     def pareto_frontier(self) -> list[dict]:
         """Solve the model 11 times across evenly spaced weight combinations and return results."""
-        weight_pairs = [(round(1.0 - i * 0.1, 1), round(i * 0.1, 1)) for i in range(11)]
+        weight_pairs = [
+            (round(1.0 - i * 0.02, 2), round(i * 0.02, 2)) for i in range(51)
+        ]
         results = []
 
         for i, (lp, lc) in enumerate(weight_pairs):
             self.lambda_profit = lp
             self.lambda_co2 = lc
-            print(f"\nλ_profit={lp:.1f}, λ_co2={lc:.1f}")
+            print(f"\nλ_profit={lp:.2f}, λ_co2={lc:.2f}")
             solved = self.solve()
-            profit, co2, breakdown = self._extract_objectives(solved)
+            profit, co2 = self._extract_objectives(solved)
             results.append(
                 {"lambda_profit": lp, "lambda_co2": lc, "profit": profit, "co2": co2}
             )
-            if i == 0:
-                self.visualize_profit_distribution(breakdown, lp, lc)
 
         return results
 
@@ -402,10 +345,37 @@ class Model2:
         profits = [r["profit"] for r in results]
         co2s = [r["co2"] for r in results]
         labels = [
-            f"λ=({r['lambda_profit']:.1f}, {r['lambda_co2']:.1f})" for r in results
+            f"λ=({r['lambda_profit']:.2f}, {r['lambda_co2']:.2f})" for r in results
         ]
 
-        fig = go.Figure(
+        fig = go.Figure()
+
+        # Shaded region: profit > 0 and CO2 < 0
+        x_max = max(profits) * 1.05
+        y_min = min(co2s) * 1.05 if min(co2s) < 0 else -1
+        fig.add_shape(
+            type="rect",
+            xref="x",
+            yref="y",
+            x0=0,
+            x1=x_max,
+            y0=y_min,
+            y1=0,
+            fillcolor="rgba(0, 200, 100, 0.15)",
+            line_width=0,
+            layer="below",
+        )
+        fig.add_annotation(
+            x=x_max,
+            y=y_min,
+            text="Profit > 0 & CO₂ < 0",
+            showarrow=False,
+            font=dict(size=10, color="green"),
+            xanchor="right",
+            yanchor="bottom",
+        )
+
+        fig.add_trace(
             go.Scatter(
                 x=profits,
                 y=co2s,
@@ -418,10 +388,10 @@ class Model2:
             )
         )
         fig.update_layout(
-            title="Pareto Frontier — Profit vs. CO₂ Emissions",
             xaxis_title="Profit (DKK)",
             yaxis_title="CO₂ Emissions (kg)",
             template="plotly_white",
+            margin=dict(l=0, r=0, t=20, b=10),
         )
         fig.show()
         fig.write_image("results/model_2_pareto_frontier.png")
