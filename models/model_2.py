@@ -317,9 +317,11 @@ class Model2:
 
     def pareto_frontier(self) -> list[dict]:
         """Solve the model 101 times across evenly spaced weight combinations and return results."""
-        weight_pairs = [
-            (round(1.0 - i * 0.01, 2), round(i * 0.01, 2)) for i in range(101)
-        ]
+        weight_pairs = (
+            [(0.9999, 0.0001)]
+            + [(round(1.0 - i * 0.01, 2), round(i * 0.01, 2)) for i in range(1, 100)]
+            + [(0.0001, 0.9999)]
+        )
         results = []
 
         for i, (lp, lc) in enumerate(weight_pairs):
@@ -354,7 +356,7 @@ class Model2:
         profits = [r["profit"] for r in results]
         co2s = [r["co2"] for r in results]
         labels = [
-            f"λ=({r['lambda_profit']:.2f}, {r['lambda_co2']:.2f})" for r in results
+            f"λ=({r['lambda_profit']:.4f}, {r['lambda_co2']:.4f})" for r in results
         ]
 
         fig = go.Figure()
