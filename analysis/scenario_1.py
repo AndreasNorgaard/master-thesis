@@ -47,18 +47,55 @@ PARETO_WEIGHT_PAIRS = (
 )
 
 
-def run_breakdown_solve(m: Model3) -> dict:
-    """Solve at λ_profit=0.9999, λ_co2=0.0001 and return the breakdown dict."""
-    lp, lc = PARETO_WEIGHT_PAIRS[0]
-    m.lambda_profit = lp
-    m.lambda_co2 = lc
-    solved = m.solve()
-    _, _, breakdown = m._extract_objectives(solved)
-    return breakdown
+def config_labels(configs: list[tuple[int, int]]) -> list[str]:
+    return [f"{mw} MW / {mwh} MWh" for mw, mwh in configs]
+
+
+def get_extreme_breakdowns(m: Model3) -> tuple[dict, dict]:
+    """Solve at the first and last Pareto weight pairs and return breakdowns."""
+    first_breakdown = last_breakdown = None
+    for i, (lp, lc) in enumerate((PARETO_WEIGHT_PAIRS[0], PARETO_WEIGHT_PAIRS[-1])):
+        m.lambda_profit = lp
+        m.lambda_co2 = lc
+        solved = m.solve()
+        _, _, breakdown = m._extract_objectives(solved)
+        if i == 0:
+            first_breakdown = breakdown
+        else:
+            last_breakdown = breakdown
+    return first_breakdown, last_breakdown
+
+
+def print_breakdown_table(
+    breakdowns: list[dict],
+    column_labels: list[str],
+    title: str,
+) -> None:
+    col_w = 16
+    label_w = 32
+    width = label_w + len(column_labels) * (col_w + 2)
+    sep = "-" * width
+
+    print(f"\n{title}")
+    print(sep)
+    header = f"{'':<{label_w}}"
+    for col in column_labels:
+        header += f"{col:>{col_w}}  "
+    print(header)
+    print(sep)
+
+    for row_label, key in BREAKDOWN_ROWS:
+        row = f"{row_label:<{label_w}}"
+        for bd in breakdowns:
+            row += f"{_row_value(bd, key):>{col_w},.2f}  "
+        print(row)
+
+    print(sep)
+    print("Note: All values in DKK.")
 
 
 def save_breakdown_excel(
-    breakdowns: list[dict],
+    sheets: list[tuple[str, list[dict]]],
     configs: list[tuple[int, int]],
     out_path: str,
 ) -> None:
@@ -66,7 +103,6 @@ def save_breakdown_excel(
     out.parent.mkdir(parents=True, exist_ok=True)
 
     wb = xlsxwriter.Workbook(str(out))
-    ws = wb.add_worksheet("Profit Breakdown")
 
     header_fmt = wb.add_format(
         {"bold": True, "align": "center", "border": 1, "bg_color": "#D9D9D9"}
@@ -78,24 +114,24 @@ def save_breakdown_excel(
     )
     bold_label_fmt = wb.add_format({"bold": True, "border": 1, "bg_color": "#F2F2F2"})
 
-    # Header row
-    ws.write(0, 0, "", header_fmt)
-    for col, (mw, mwh) in enumerate(configs, start=1):
-        ws.write(0, col, f"{mw} MW / {mwh} MWh", header_fmt)
+    for sheet_name, breakdowns in sheets:
+        ws = wb.add_worksheet(sheet_name[:31])
 
-    # Data rows
-    for row_idx, (label, key) in enumerate(BREAKDOWN_ROWS, start=1):
-        is_total = label == "Profit"
-        lf = bold_label_fmt if is_total else label_fmt
-        nf = bold_num_fmt if is_total else num_fmt
-        ws.write(row_idx, 0, label, lf)
-        for col, breakdown in enumerate(breakdowns, start=1):
-            value = _row_value(breakdown, key)
-            ws.write(row_idx, col, value, nf)
+        ws.write(0, 0, "", header_fmt)
+        for col, (mw, mwh) in enumerate(configs, start=1):
+            ws.write(0, col, f"{mw} MW / {mwh} MWh", header_fmt)
 
-    # Column widths
-    ws.set_column(0, 0, 28)
-    ws.set_column(1, len(configs), 18)
+        for row_idx, (label, key) in enumerate(BREAKDOWN_ROWS, start=1):
+            is_total = label == "Profit"
+            lf = bold_label_fmt if is_total else label_fmt
+            nf = bold_num_fmt if is_total else num_fmt
+            ws.write(row_idx, 0, label, lf)
+            for col, breakdown in enumerate(breakdowns, start=1):
+                value = _row_value(breakdown, key)
+                ws.write(row_idx, col, value, nf)
+
+        ws.set_column(0, 0, 28)
+        ws.set_column(1, len(configs), 18)
 
     wb.close()
     print(f"Breakdown saved to {out}")
@@ -116,19 +152,24 @@ def save_pareto_excel(results: list[dict], out_path: str) -> None:
     print(f"Pareto data saved to {out}")
 
 
-def run_pareto(m: Model3) -> list[dict]:
-    """Run 101 weight pairs and collect profit + CO2."""
+def run_pareto(m: Model3) -> tuple[list[dict], dict, dict]:
+    """Run 101 weight pairs and collect profit + CO2 and extreme breakdowns."""
     results = []
-    for lp, lc in PARETO_WEIGHT_PAIRS:
+    first_breakdown = last_breakdown = None
+    for i, (lp, lc) in enumerate(PARETO_WEIGHT_PAIRS):
         m.lambda_profit = lp
         m.lambda_co2 = lc
         print(f"  λ_profit={lp:.2f}, λ_co2={lc:.2f}")
         solved = m.solve()
-        profit, co2, _ = m._extract_objectives(solved)
+        profit, co2, breakdown = m._extract_objectives(solved)
+        if i == 0:
+            first_breakdown = breakdown
+        if i == len(PARETO_WEIGHT_PAIRS) - 1:
+            last_breakdown = breakdown
         results.append(
             {"lambda_profit": lp, "lambda_co2": lc, "profit": profit, "co2": co2}
         )
-    return results
+    return results, first_breakdown, last_breakdown
 
 
 PARETO_COLORS = ["steelblue", "seagreen", "darkorange"]
@@ -222,10 +263,12 @@ def visualize_asset_pareto(
 
 
 if __name__ == "__main__":
-    breakdowns = []
+    profit_breakdowns: list[dict] = []
+    co2_breakdowns: list[dict] = []
     all_pareto_results = []
 
     breakdown_path = Path("results/asset_configuration_breakdown.xlsx")
+    column_labels = config_labels(CONFIGS)
 
     for bat_mw, bat_mwh in CONFIGS:
         label = f"{bat_mw}mw_{bat_mwh}mwh"
@@ -235,28 +278,45 @@ if __name__ == "__main__":
         print(f"Asset: {bat_mw} MW / {bat_mwh} MWh")
         print(f"{'=' * 60}")
 
+        m = Model3(
+            start_date=START_DATE,
+            end_date=END_DATE,
+            bat_mw=bat_mw,
+            bat_mwh=bat_mwh,
+        )
+
         if Path(pareto_path).exists():
             print(f"  Loading cached Pareto data from {pareto_path}")
             pareto_results = load_pareto_excel(pareto_path)
+            print("\n  Breakdown at Pareto extremes")
+            first_bd, last_bd = get_extreme_breakdowns(m)
         else:
-            m = Model3(
-                start_date=START_DATE,
-                end_date=END_DATE,
-                bat_mw=bat_mw,
-                bat_mwh=bat_mwh,
-            )
-            if not breakdown_path.exists():
-                print("\n[1/2] Breakdown solve (λ_profit=0.9999, λ_co2=0.0001)")
-                breakdown = run_breakdown_solve(m)
-                breakdowns.append(breakdown)
-
-            print("\n[2/2] Pareto sweep (101 solves)")
-            pareto_results = run_pareto(m)
+            print("\n  Pareto sweep (101 solves)")
+            pareto_results, first_bd, last_bd = run_pareto(m)
             save_pareto_excel(pareto_results, pareto_path)
 
+        profit_breakdowns.append(first_bd)
+        co2_breakdowns.append(last_bd)
         all_pareto_results.append(pareto_results)
 
-    if not breakdown_path.exists() and breakdowns:
-        save_breakdown_excel(breakdowns, CONFIGS, str(breakdown_path))
+    print_breakdown_table(
+        profit_breakdowns,
+        column_labels,
+        "Profit extreme (λ_profit=0.9999, λ_co2=0.0001)",
+    )
+    print_breakdown_table(
+        co2_breakdowns,
+        column_labels,
+        "CO₂ extreme (λ_profit=0.0001, λ_co2=0.9999)",
+    )
+
+    save_breakdown_excel(
+        [
+            ("Profit extreme", profit_breakdowns),
+            ("CO2 extreme", co2_breakdowns),
+        ],
+        CONFIGS,
+        str(breakdown_path),
+    )
 
     visualize_asset_pareto(all_pareto_results, CONFIGS)
