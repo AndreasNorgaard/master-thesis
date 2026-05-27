@@ -14,7 +14,7 @@ class Model2:
         start_date: str,
         end_date: str,
     ):
-        self.results_file_path = "results/model_2.xlsx"
+        self.results_file_path = "results/model_2/model_2.xlsx"
 
         # Set dates
         self.start_date = start_date
@@ -57,7 +57,7 @@ class Model2:
         df_co2 = client.co2_emissions(write_to_file=False)
         self.df = self.create_dataset(df_da, df_co2)
         if write_to_file:
-            out = Path("data/prepared/model_2.xlsx")
+            out = Path("data/prepared/model_2/model_2.xlsx")
             out.parent.mkdir(parents=True, exist_ok=True)
             self.df.write_excel(out)
 
@@ -399,7 +399,7 @@ class Model2:
             margin=dict(l=0, r=0, t=20, b=10),
         )
         fig.show()
-        fig.write_image("results/model_2_pareto_frontier.png")
+        fig.write_image("results/model_2/pareto_frontier.png")
 
 
 if __name__ == "__main__":

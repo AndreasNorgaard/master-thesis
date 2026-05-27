@@ -250,7 +250,7 @@ def visualize_price_pareto(
         margin=dict(l=0, r=0, t=40, b=10),
     )
 
-    out = Path("results/price_scenarios_pareto.png")
+    out = Path("results/scenario_2/pareto.png")
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.show()
     fig.write_image(str(out))
@@ -262,12 +262,12 @@ if __name__ == "__main__":
     co2_breakdowns: list[dict] = []
     all_pareto_results = []
 
-    breakdown_path = Path("results/price_scenarios_breakdown.xlsx")
+    breakdown_path = Path("results/scenario_2/breakdown.xlsx")
     scenario_labels = [name for name, _, _ in SCENARIOS]
 
     for name, start_date, end_date in SCENARIOS:
         label = name.lower()
-        pareto_path = f"results/price_scenarios_pareto_{label}.xlsx"
+        pareto_path = f"results/scenario_2/pareto_{label}.xlsx"
 
         print(f"\n{'=' * 60}")
         print(f"Scenario: {name}  ({start_date} → {end_date})")

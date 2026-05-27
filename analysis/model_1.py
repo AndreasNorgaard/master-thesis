@@ -11,7 +11,7 @@ from data.energi_data_service import EnergiDataServiceAPIClient
 
 class Model1:
     def __init__(self, start_date: str, end_date: str):
-        self.results_file_path = "results/model_1.xlsx"
+        self.results_file_path = "results/model_1/model_1.xlsx"
 
         # Set dates
         self.start_date = start_date
@@ -97,7 +97,7 @@ class Model1:
 
         self.df = df_quarters
         if write_to_file:
-            out = Path("data/prepared/model_1.xlsx")
+            out = Path("data/prepared/model_1/model_1.xlsx")
             out.parent.mkdir(parents=True, exist_ok=True)
             self.df.write_excel(out)
 
@@ -319,7 +319,7 @@ class Model1:
             margin=dict(l=0, r=0, t=20, b=10),
         )
         fig.show()
-        fig.write_image("results/model_1_profit.png")
+        fig.write_image("results/model_1/profit.png")
 
     def visualize_schedule(self, model):
         Q = len(self.df)
@@ -408,7 +408,7 @@ class Model1:
         )
 
         fig.show()
-        fig.write_image("results/model_1_schedule.png")
+        fig.write_image("results/model_1/schedule.png")
 
     def visualize_schedule_with_price(self, model):
         Q = len(self.df)
@@ -483,7 +483,7 @@ class Model1:
         )
 
         fig.show()
-        fig.write_image("results/model_1_schedule_with_price.png")
+        fig.write_image("results/model_1/schedule_with_price.png")
 
 
 if __name__ == "__main__":

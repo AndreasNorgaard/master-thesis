@@ -22,7 +22,7 @@ class Model3:
         bat_mw: float = 2,
         bat_mwh: float = 4,
     ):
-        self.results_file_path = "results/model_3.xlsx"
+        self.results_file_path = "results/model_3/model_3.xlsx"
 
         # Set dates
         self.start_date = start_date
@@ -793,7 +793,7 @@ class Model3:
         breakdown: dict,
         lambda_profit: float,
         lambda_co2: float,
-        out_file: str = "results/model_3_profit.png",
+        out_file: str = "results/model_3/profit.png",
     ) -> None:
         """Plot a waterfall chart of the profit breakdown for one weight pair."""
         labels = [
@@ -865,7 +865,7 @@ class Model3:
     def visualize_schedule(
         self,
         model,
-        out_file: str = "results/model_3_schedule.png",
+        out_file: str = "results/model_3/schedule.png",
     ) -> None:
         """Stacked production schedule: DA + all capacity-auction allocations + SoC."""
         Q = len(self.df)
@@ -1023,11 +1023,11 @@ class Model3:
                     breakdown,
                     lp,
                     lc,
-                    out_file="results/model_3_profit_co2_saving_extreme.png",
+                    out_file="results/model_3/profit_co2_saving_extreme.png",
                 )
                 self.visualize_schedule(
                     solved,
-                    out_file="results/model_3_schedule_co2_saving_extreme.png",
+                    out_file="results/model_3/schedule_co2_saving_extreme.png",
                 )
 
         return results
@@ -1094,7 +1094,7 @@ class Model3:
             margin=dict(l=0, r=0, t=20, b=10),
         )
         fig.show()
-        fig.write_image("results/model_3_pareto_frontier.png")
+        fig.write_image("results/model_3/pareto_frontier.png")
 
 
 if __name__ == "__main__":

@@ -255,7 +255,7 @@ def visualize_asset_pareto(
         margin=dict(l=0, r=0, t=40, b=10),
     )
 
-    out = Path("results/asset_configuration_pareto.png")
+    out = Path("results/scenario_1/pareto.png")
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.show()
     fig.write_image(str(out))
@@ -267,12 +267,12 @@ if __name__ == "__main__":
     co2_breakdowns: list[dict] = []
     all_pareto_results = []
 
-    breakdown_path = Path("results/asset_configuration_breakdown.xlsx")
+    breakdown_path = Path("results/scenario_1/breakdown.xlsx")
     column_labels = config_labels(CONFIGS)
 
     for bat_mw, bat_mwh in CONFIGS:
         label = f"{bat_mw}mw_{bat_mwh}mwh"
-        pareto_path = f"results/pareto_{label}.xlsx"
+        pareto_path = f"results/scenario_1/pareto_{label}.xlsx"
 
         print(f"\n{'=' * 60}")
         print(f"Asset: {bat_mw} MW / {bat_mwh} MWh")
