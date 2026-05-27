@@ -745,7 +745,7 @@ class Model3:
         # print(f"  mFRR down Revenue:     {mfrr_down_rev:>12.2f} DKK")
         # print(f"  Reserve Revenue:       {reserve_rev:>12.2f} DKK")
         print(f"  Total Profit:          {profit:>12.2f} DKK")
-        print(f"  CO2 Emissions:         {co2:>12.4f} kg")
+        print(f"  CO2 Emissions:         {co2:>12.2f} kg")
 
         breakdown = {
             "da_revenue": da_revenue,
@@ -776,6 +776,7 @@ class Model3:
         breakdown: dict,
         lambda_profit: float,
         lambda_co2: float,
+        out_file: str = "results/model_3_profit.png",
     ) -> None:
         """Plot a waterfall chart of the profit breakdown for one weight pair."""
         labels = [
@@ -842,9 +843,13 @@ class Model3:
             margin=dict(l=0, r=0, t=20, b=10),
         )
         fig.show()
-        fig.write_image("results/model_3_profit.png")
+        fig.write_image(out_file)
 
-    def visualize_schedule(self, model) -> None:
+    def visualize_schedule(
+        self,
+        model,
+        out_file: str = "results/model_3_schedule.png",
+    ) -> None:
         """Stacked production schedule: DA + all capacity-auction allocations + SoC."""
         Q = len(self.df)
         times = self.df["TimeDK"].to_list()
@@ -973,7 +978,7 @@ class Model3:
         )
 
         fig.show()
-        fig.write_image("results/model_3_schedule.png")
+        fig.write_image(out_file)
 
     def pareto_frontier(self) -> list[dict]:
         """Solve the model 101 times across evenly spaced weight combinations and return results."""
@@ -996,6 +1001,17 @@ class Model3:
             if i == 0:
                 self.visualize_profit_distribution(breakdown, lp, lc)
                 self.visualize_schedule(solved)
+            if i == len(weight_pairs) - 1:
+                self.visualize_profit_distribution(
+                    breakdown,
+                    lp,
+                    lc,
+                    out_file="results/model_3_profit_co2_saving_extreme.png",
+                )
+                self.visualize_schedule(
+                    solved,
+                    out_file="results/model_3_schedule_co2_saving_extreme.png",
+                )
 
         return results
 
@@ -1017,9 +1033,6 @@ class Model3:
     def visualize_pareto_frontier(self, results: list[dict]):
         profits = [r["profit"] for r in results]
         co2s = [r["co2"] for r in results]
-        labels = [
-            f"λ=({r['lambda_profit']:.4f}, {r['lambda_co2']:.4f})" for r in results
-        ]
 
         fig = go.Figure()
 
@@ -1052,10 +1065,7 @@ class Model3:
             go.Scatter(
                 x=profits,
                 y=co2s,
-                mode="lines+markers+text",
-                text=labels,
-                textposition="top right",
-                textfont=dict(size=10),
+                mode="lines+markers",
                 marker=dict(size=8, color="seagreen"),
                 line=dict(color="seagreen", width=1.5),
             )

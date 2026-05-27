@@ -311,7 +311,7 @@ class Model2:
         # print(f"  Consumption Tariffs: {-cons_tariff:>10.2f} DKK")
         # print(f"  Degradation Cost:    {-degradation:>10.2f} DKK")
         print(f"  Net Profit:          {profit:>10.2f} DKK")
-        print(f"  CO2 Emissions:       {co2:>10.4f} kg")
+        print(f"  CO2 Emissions:       {co2:>10.2f} kg")
 
         return profit, co2
 
@@ -327,7 +327,7 @@ class Model2:
         for i, (lp, lc) in enumerate(weight_pairs):
             self.lambda_profit = lp
             self.lambda_co2 = lc
-            print(f"\nλ_profit={lp:.2f}, λ_co2={lc:.2f}")
+            print(f"\nλ_profit={lp:.4f}, λ_co2={lc:.4f}")
             solved = self.solve()
             profit, co2 = self._extract_objectives(solved)
             results.append(
@@ -355,9 +355,6 @@ class Model2:
         """Plot the Pareto frontier from the results of pareto_frontier()."""
         profits = [r["profit"] for r in results]
         co2s = [r["co2"] for r in results]
-        labels = [
-            f"λ=({r['lambda_profit']:.4f}, {r['lambda_co2']:.4f})" for r in results
-        ]
 
         fig = go.Figure()
 
@@ -390,10 +387,7 @@ class Model2:
             go.Scatter(
                 x=profits,
                 y=co2s,
-                mode="lines+markers+text",
-                text=labels,
-                textposition="top right",
-                textfont=dict(size=10),
+                mode="lines+markers",
                 marker=dict(size=8, color="steelblue"),
                 line=dict(color="steelblue", width=1.5),
             )
