@@ -777,8 +777,12 @@ class SequentialModel:
         return [first_offset + i for i in range(n_days)]
 
     def pareto_frontier(self, use_forecast: bool) -> list[dict]:
-        """11 evenly spaced weight pairs from (1.0, 0.0) to (0.0, 1.0)."""
-        weight_pairs = [(round(1.0 - i * 0.1, 2), round(i * 0.1, 2)) for i in range(11)]
+        """101 weight pairs: extremes plus 99 evenly spaced pairs in between."""
+        weight_pairs = (
+            [(0.9999, 0.0001)]
+            + [(round(1.0 - i * 0.01, 2), round(i * 0.01, 2)) for i in range(1, 100)]
+            + [(0.0001, 0.9999)]
+        )
         offsets = self._delivery_day_offsets()
         label = "forecast" if use_forecast else "realized"
         results: list[dict] = []

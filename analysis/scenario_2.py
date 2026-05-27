@@ -39,10 +39,18 @@ def _row_value(breakdown: dict, key: str) -> float:
     return breakdown[key]
 
 
+PARETO_WEIGHT_PAIRS = (
+    [(0.9999, 0.0001)]
+    + [(round(1.0 - i * 0.01, 2), round(i * 0.01, 2)) for i in range(1, 100)]
+    + [(0.0001, 0.9999)]
+)
+
+
 def run_breakdown_solve(m: Model3) -> dict:
-    """Solve at λ_profit=1.0, λ_co2=0.0 and return the breakdown dict."""
-    m.lambda_profit = 1.0
-    m.lambda_co2 = 0.0
+    """Solve at λ_profit=0.9999, λ_co2=0.0001 and return the breakdown dict."""
+    lp, lc = PARETO_WEIGHT_PAIRS[0]
+    m.lambda_profit = lp
+    m.lambda_co2 = lc
     solved = m.solve()
     _, _, breakdown = m._extract_objectives(solved)
     return breakdown
@@ -107,10 +115,9 @@ def save_pareto_excel(results: list[dict], out_path: str) -> None:
 
 
 def run_pareto(m: Model3) -> list[dict]:
-    """Run 101 evenly-spaced weight pairs and collect profit + CO2."""
-    weight_pairs = [(round(1.0 - i * 0.01, 2), round(i * 0.01, 2)) for i in range(101)]
+    """Run 101 weight pairs and collect profit + CO2."""
     results = []
-    for lp, lc in weight_pairs:
+    for lp, lc in PARETO_WEIGHT_PAIRS:
         m.lambda_profit = lp
         m.lambda_co2 = lc
         print(f"  λ_profit={lp:.2f}, λ_co2={lc:.2f}")
@@ -238,7 +245,7 @@ if __name__ == "__main__":
                 bat_mwh=BAT_MWH,
             )
             if not breakdown_path.exists():
-                print("\n[1/2] Breakdown solve (λ_profit=1.0, λ_co2=0.0)")
+                print("\n[1/2] Breakdown solve (λ_profit=0.9999, λ_co2=0.0001)")
                 breakdown = run_breakdown_solve(m)
                 breakdowns.append(breakdown)
 
