@@ -42,7 +42,10 @@ class Model3:
         self.n_cycles = 2  # Max full cycles per day (contractual limit)
 
         # Tariffs (Appendix B of thesis, DKK/MWh)
-        self.tariff_prod = 15.5
+        if self.start_date == "2026-01-01":
+            self.tariff_prod = 16.2  # Winter tariff
+        else:
+            self.tariff_prod = 15.5  # Summer tariff
 
         # Endurance requirements (hours)
         self.E_FCRD = 1.0 / 3.0  # 20 minutes
@@ -120,6 +123,29 @@ class Model3:
             years=range(int(self.start_date[:4]), int(self.end_date[:4]) + 1)
         )
         holiday_dates = set(dk_holidays.keys())
+        if self.start_date == "2026-01-01":
+            dso_tariff_expr = (
+                pl.when((pl.col("weekday") < 5) & (~pl.col("is_holiday")))
+                .then(
+                    pl.when(pl.col("hour") < 6)
+                    .then(30.9)
+                    .when(pl.col("hour") < 21)
+                    .then(185.3)
+                    .otherwise(92.6)
+                )
+                .otherwise(pl.when(pl.col("hour") < 6).then(30.9).otherwise(92.6))
+            )
+        else:
+            dso_tariff_expr = (
+                pl.when(
+                    (pl.col("weekday") < 5)
+                    & (pl.col("hour") >= 6)
+                    & (~pl.col("is_holiday"))
+                )
+                .then(91.1)
+                .otherwise(30.4)
+            )
+
         df = (
             df.with_columns(
                 pl.col("TimeDK").dt.hour().alias("hour"),
@@ -129,16 +155,7 @@ class Model3:
                 .is_in(list(holiday_dates))
                 .alias("is_holiday"),
             )
-            .with_columns(
-                pl.when(
-                    (pl.col("weekday") < 5)
-                    & (pl.col("hour") >= 6)
-                    & (~pl.col("is_holiday"))
-                )
-                .then(91.1)
-                .otherwise(30.4)
-                .alias("dso_tariff")
-            )
+            .with_columns(dso_tariff_expr.alias("dso_tariff"))
             .with_columns(
                 (
                     72.0
