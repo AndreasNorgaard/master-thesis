@@ -4,7 +4,7 @@ import plotly.graph_objects as go
 import polars as pl
 import xlsxwriter
 
-from models.model_3 import Model3
+from analysis.model_3 import Model3
 
 START_DATE = "2026-04-01"
 END_DATE = "2026-04-30"

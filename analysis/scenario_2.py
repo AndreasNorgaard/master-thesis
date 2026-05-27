@@ -4,7 +4,7 @@ import plotly.graph_objects as go
 import polars as pl
 import xlsxwriter
 
-from models.model_3 import Model3
+from analysis.model_3 import Model3
 
 BAT_MW = 2
 BAT_MWH = 4
