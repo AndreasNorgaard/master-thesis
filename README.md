@@ -23,14 +23,20 @@ cp .env.example .env
 Ensure the virtual environment is activated first (see [Setup](#setup)), then:
 
 ```bash
-# Run Model 1 (profit maximization)
-python -m models.model_1
+# Run Model 1: Profit maximization)
+python -m analysis.model_1
 
-# Run Model 2 (multi-objective: profit + CO2)
-python -m models.model_2
+# Run Model 2: Multi-objective (profit + CO2)
+python -m analysis.model_2
 
-# Run Model 2 (extended multi-objective: profit + CO2)
-python -m models.model_3
+# Run Model 3: Extended multi-objective (profit + CO2)
+python -m analysis.model_3
+
+# Run Scenario Analysis 1: Asset configuration
+python -m analysis.scenario_1
+
+# Run Scenario Analysis 2: Price scenarios
+python -m analysis.scenario_2
 ```
 
 ## Common Commands
