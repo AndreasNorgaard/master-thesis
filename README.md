@@ -12,12 +12,6 @@ uv sync
 source .venv/bin/activate
 ```
 
-Copy `.env.example` to `.env` and fill in your API keys:
-
-```bash
-cp .env.example .env
-```
-
 ## Running Models
 
 Ensure the virtual environment is activated first (see [Setup](#setup)), then:
