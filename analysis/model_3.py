@@ -1048,14 +1048,38 @@ class Model3:
         print(f"\nResults saved to {out}")
 
     def visualize_pareto_frontier(self, results: list[dict]):
-        profits = [r["profit"] for r in results]
-        co2s = [r["co2"] for r in results]
+        profits3 = [r["profit"] for r in results]
+        co2s3 = [r["co2"] for r in results]
+        labels3 = [
+            f"λ=({r['lambda_profit']:.2f}, {r['lambda_co2']:.2f})" for r in results
+        ]
+
+        # Try to load Model 2 results for overlay comparison.
+        profits2: list[float] = []
+        co2s2: list[float] = []
+        labels2: list[str] = []
+        model_2_path = Path("results/model_2/model_2.xlsx")
+        if model_2_path.exists():
+            df2 = pl.read_excel(str(model_2_path))
+            profits2 = df2["profit_dkk"].to_list()
+            co2s2 = df2["co2_kg"].to_list()
+            labels2 = [
+                f"λ=({r['lambda_profit']:.2f}, {r['lambda_co2']:.2f})"
+                for r in df2.iter_rows(named=True)
+            ]
+        else:
+            print(
+                f"Model 2 results not found at {model_2_path}; plotting only Model 3."
+            )
+
+        all_profits = profits3 + profits2
+        all_co2s = co2s3 + co2s2
+        x_max = max(all_profits) * 1.05
+        y_min = min(all_co2s) * 1.05 if min(all_co2s) < 0 else -1
 
         fig = go.Figure()
 
         # Shaded region: profit > 0 and CO2 < 0
-        x_max = max(profits) * 1.05
-        y_min = min(co2s) * 1.05 if min(co2s) < 0 else -1
         fig.add_shape(
             type="rect",
             xref="x",
@@ -1078,12 +1102,29 @@ class Model3:
             yanchor="bottom",
         )
 
+        if profits2:
+            fig.add_trace(
+                go.Scatter(
+                    x=profits2,
+                    y=co2s2,
+                    mode="lines+markers",
+                    name="Model 2",
+                    text=labels2,
+                    hovertemplate="%{text}<br>Profit: %{x:.2f} DKK<br>CO₂: %{y:.4f} kg<extra></extra>",
+                    marker=dict(size=6, color="steelblue"),
+                    line=dict(color="steelblue", width=1.5),
+                )
+            )
+
         fig.add_trace(
             go.Scatter(
-                x=profits,
-                y=co2s,
+                x=profits3,
+                y=co2s3,
                 mode="lines+markers",
-                marker=dict(size=8, color="seagreen"),
+                name="Model 3",
+                text=labels3,
+                hovertemplate="%{text}<br>Profit: %{x:.2f} DKK<br>CO₂: %{y:.4f} kg<extra></extra>",
+                marker=dict(size=6, color="seagreen"),
                 line=dict(color="seagreen", width=1.5),
             )
         )
@@ -1091,7 +1132,14 @@ class Model3:
             xaxis_title="Profit (DKK)",
             yaxis_title="CO₂ Emissions (kg)",
             template="plotly_white",
-            margin=dict(l=0, r=0, t=20, b=10),
+            legend=dict(
+                orientation="h",
+                yanchor="top",
+                y=-0.075,
+                xanchor="center",
+                x=0.5,
+            ),
+            margin=dict(l=0, r=0, t=40, b=10),
         )
         fig.show()
         fig.write_image("results/model_3/pareto_frontier.png")
