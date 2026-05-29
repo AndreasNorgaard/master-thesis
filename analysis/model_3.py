@@ -21,6 +21,9 @@ class Model3:
         end_date: str,
         bat_mw: float = 2,
         bat_mwh: float = 4,
+        df: pl.DataFrame | None = None,
+        df_hourly: pl.DataFrame | None = None,
+        df_block: pl.DataFrame | None = None,
     ):
         self.results_file_path = "results/model_3/model_3.xlsx"
 
@@ -53,8 +56,14 @@ class Model3:
         self.E_aFRR = 4.0
         self.E_mFRR = 0.25  # 15 minutes
 
-        # Load data
-        self.load_data()
+        # Either reuse caller-provided frames (e.g. so a parent model can
+        # share its already-fetched dataset) or fetch from the API now.
+        if df is not None and df_hourly is not None and df_block is not None:
+            self.df = df
+            self.df_hourly = df_hourly
+            self.df_block = df_block
+        else:
+            self.load_data()
 
     def load_data(self, write_to_file: bool = True):
         client = EnergiDataServiceAPIClient(

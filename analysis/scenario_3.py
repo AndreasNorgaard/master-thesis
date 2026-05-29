@@ -1,66 +1,68 @@
-"""
-Sequential / rolling-horizon model for Analysis 3 (Section 6.3).
-
-The model simulates the actual Danish bidding sequence by solving a 3-day
-look-ahead LP five times per delivery day, once at each auction closure
-(D-2 15:00 FCR early; D-1 07:30 aFRR up/down and mFRR up/down -- treated
-as one combined pool because they clear simultaneously; D-1 12:00
-day-ahead; D-1 15:00 FFR; D-1 18:00 FCR late). Capacity bids committed in
-earlier pools for the delivery day are fixed before solving the next pool.
-
-Two variants are produced: one with forecasted prices (24h-lagged realized
-prices, naive forecast) and one with realized prices. The forecast variant
-captures both the structural cost of sequential commitment and the cost of
-forecast error; the realized variant isolates only the structural cost.
-
-The file is intentionally self-contained: it duplicates the data-loading and
-constraint logic from ``models.model_3`` so it can be read in isolation.
-"""
-
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import holidays
 import plotly.graph_objects as go
 import polars as pl
 import pyomo.environ as pyo
-import xlsxwriter
+from plotly.subplots import make_subplots
 
+from analysis.model_3 import Model3
 from data.energi_data_service import EnergiDataServiceAPIClient
 
 
-class SequentialModel:
-    EUR_TO_DKK = 7.4588
+class Model4(Model3):
+    """Sequential five-auction bidding extension of Model 3.
 
-    # Pool index -> list of (product, idx_type). idx_type is 'q' (quarterly),
-    # 'h' (hourly) or 'b' (4-hour block). The order is the chronological order
-    # of auction closures around delivery day D.
-    POOL_PRODUCTS: dict[int, list[tuple[str, str]]] = {
-        1: [("fcrn_E", "h"), ("fcrd_up_E", "h"), ("fcrd_down_E", "h")],
-        2: [
-            ("afrr_up", "b"),
-            ("afrr_down", "b"),
-            ("mfrr_up", "h"),
-            ("mfrr_down", "h"),
-        ],
-        3: [("da_buy", "q"), ("da_sell", "q")],
-        4: [("ffr", "h")],
-        5: [("fcrn_L", "h"), ("fcrd_up_L", "h"), ("fcrd_down_L", "h")],
-    }
+    The model solves Model 3 five times per delivery day (once per auction
+    closure). At each auction, the day-of-delivery bids for that auction's
+    products are captured as fixed parameters and excluded from subsequent
+    solves. Optimization at each auction looks ahead two days beyond the
+    delivery day; days outside this window are not modelled.
 
-    HOURLY_PRODUCTS = [
+    The model can be run with realized prices (perfect information within
+    the sequential structure) or with a naive forecast where each delivery
+    day's window is priced using the realized values of the prior day (D-1).
+    """
+
+    AUCTIONS = [
+        ("A1_FCR_early", ["fcrn_E", "fcrd_up_E", "fcrd_down_E"]),
+        ("A2_aFRR_mFRR", ["afrr_up", "afrr_down", "mfrr_up", "mfrr_down"]),
+        ("A3_DA", ["da_buy", "da_sell"]),
+        ("A4_FFR", ["ffr"]),
+        ("A5_FCR_late", ["fcrn_L", "fcrd_up_L", "fcrd_down_L"]),
+    ]
+
+    QUARTERLY_VARS = {"da_buy", "da_sell"}
+    HOURLY_VARS = {
         "ffr",
+        "fcrn_E",
+        "fcrn_L",
         "fcrd_up_E",
         "fcrd_up_L",
         "fcrd_down_E",
         "fcrd_down_L",
-        "fcrn_E",
-        "fcrn_L",
         "mfrr_up",
         "mfrr_down",
-    ]
-    BLOCK_PRODUCTS = ["afrr_up", "afrr_down"]
-    QUARTERLY_PRODUCTS = ["da_buy", "da_sell"]
+    }
+    BLOCK_VARS = {"afrr_up", "afrr_down"}
+
+    PARETO_WEIGHTS = (
+        [(0.9999, 0.0001)]
+        + [(round(1.0 - i * 0.01, 2), round(i * 0.01, 2)) for i in range(1, 100)]
+        + [(0.0001, 0.9999)]
+    )
+
+    # Numerical slack (in MWh / MW) applied to constraints that bind on
+    # values pinned from a prior LP. GLPK's reported optimal values can
+    # drift up to ~1e-5 from the exact constraint boundary; without this
+    # tolerance the next rolling solve sees a slightly-violated cycle cap
+    # or LER constraint and refuses to start. The slack is well below the
+    # physical resolution of the model and does not affect economics.
+    NUM_TOL = 1e-4
+    # Half-width of the box added around each fixed bid in subsequent
+    # rolling solves. Big enough to swallow GLPK's solution tolerance,
+    # small enough that the bid is still effectively committed.
+    PIN_SLACK = 1e-4
 
     HOURLY_PRICE_COLS = {
         "ffr": "P_FFR",
@@ -84,64 +86,35 @@ class SequentialModel:
         end_date: str,
         bat_mw: float = 2,
         bat_mwh: float = 4,
+        lookahead_days: int = 2,
     ):
-        self.results_file_path = "results/price_uncertainty.xlsx"
-        self.start_date = start_date
-        self.end_date = end_date
+        # Energi Data Service treats `end` as exclusive, so passing
+        # 2026-04-30 yields 29 delivery days (Apr 1 .. Apr 29). We mirror
+        # Model 3's convention here so the two horizons are identical and
+        # the frontiers are directly comparable.
+        super().__init__(start_date, end_date, bat_mw, bat_mwh)
+        # Number of extra delivery days included in each rolling LP window.
+        # 0 = optimize the delivery day in isolation; 2 = the original
+        # behaviour (delivery day plus a two-day look-ahead).
+        self.lookahead_days = lookahead_days
+        self.results_file_path = "results/scenario_3/results.xlsx"
 
-        # BESS configuration (identical to Model 3)
-        self.bat_mw = bat_mw
-        self.bat_mwh = bat_mwh
-        self.bat_charge_eff = 0.99
-        self.bat_discharge_eff = 0.87
-        self.soc_initial_frac = 0.50
-        self.soc_initial = self.soc_initial_frac * self.bat_mwh
-        self.soc_min = 0.05 * self.bat_mwh
-        self.soc_max = 0.95 * self.bat_mwh
-        self.soc_quarterly_loss = 0.025 / (30 * 24 * 4)
-        self.delta_t = 0.25
-        self.cycle_cost = 13.0 * 7.44
-        self.n_cycles = 2
-
-        self.tariff_prod = 15.5
-
-        self.E_FCRD = 1.0 / 3.0
-        self.E_FCRN = 1.0
-        self.E_aFRR = 4.0
-        self.E_mFRR = 0.25
-
-        # Weight parameters are reset before each solve.
-        self.lambda_profit = 1.0
-        self.lambda_co2 = 0.0
-
-        self.load_data()
-
-    # ---------------------------------------------------------------- data
+    # --------------------- Data loading ---------------------
 
     def load_data(self, write_to_file: bool = False) -> None:
-        """Load realized series over [start - 1 day, end + 2 days].
-
-        The extra day at the front provides a 24-hour-lagged forecast for the
-        first delivery day; the extra two days at the back provide the
-        look-ahead window for the last delivery day.
+        """Fetch the full dataset over [start_date - 1 day, end_date] in a
+        single round-trip per endpoint, then split it into the main horizon
+        and the single prior day used by the naive forecast. Overrides the
+        parent's two-call behaviour to avoid hitting each Energi Data Service
+        endpoint twice.
         """
-        sd = (
-            (datetime.fromisoformat(self.start_date) - timedelta(days=1))
-            .date()
-            .isoformat()
-        )
-        # +3: the API's `end` is exclusive, so to include `end_date + 2`
-        # (the last look-ahead day) we must request one further day.
-        ed = (
-            (datetime.fromisoformat(self.end_date) + timedelta(days=3))
-            .date()
-            .isoformat()
-        )
-        self._data_start = sd
-        self._data_end = ed
+        sd = datetime.strptime(self.start_date, "%Y-%m-%d")
+        prior_start = (sd - timedelta(days=1)).strftime("%Y-%m-%d")
 
         client = EnergiDataServiceAPIClient(
-            start_date=sd, end_date=ed, price_area="DK2"
+            start_date=prior_start,
+            end_date=self.end_date,
+            price_area="DK2",
         )
         df_da = client.day_ahead_prices(write_to_file=False)
         df_co2 = client.co2_emissions(write_to_file=False)
@@ -149,656 +122,520 @@ class SequentialModel:
         df_fcr_nd = client.fcr_nd_capacity(write_to_file=False)
         df_afrr = client.afrr_capacity(write_to_file=False)
         df_mfrr = client.mfrr_capacity(write_to_file=False)
-
-        self.df, self.df_hourly, self.df_block = self._create_dataset(
+        df_full, df_hourly_full, df_block_full = self.create_dataset(
             df_da, df_co2, df_ffr, df_fcr_nd, df_afrr, df_mfrr
         )
 
-        if write_to_file:
-            out = Path("data/prepared/price_uncertainty.xlsx")
-            out.parent.mkdir(parents=True, exist_ok=True)
-            wb = xlsxwriter.Workbook(str(out))
-            self.df.write_excel(wb, worksheet="quarterly")
-            self.df_hourly.write_excel(wb, worksheet="hourly")
-            self.df_block.write_excel(wb, worksheet="blocks")
-            wb.close()
+        # First 96 quarters / 24 hours / 6 blocks belong to the prior day.
+        self.df_prior = df_full.slice(0, 96)
+        self.df_hourly_prior = df_hourly_full.slice(0, 24)
+        self.df_block_prior = df_block_full.slice(0, 6)
+        # The remaining rows are the optimisation horizon proper.
+        self.df = df_full.slice(96, df_full.height - 96)
+        self.df_hourly = df_hourly_full.slice(24, df_hourly_full.height - 24)
+        self.df_block = df_block_full.slice(6, df_block_full.height - 6)
 
-    def _create_dataset(
-        self,
-        df_da: pl.DataFrame,
-        df_co2: pl.DataFrame,
-        df_ffr: pl.DataFrame,
-        df_fcr_nd: pl.DataFrame,
-        df_afrr: pl.DataFrame,
-        df_mfrr: pl.DataFrame,
-    ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
-        """Duplicated from ``Model3.create_dataset`` so this file is standalone."""
-        df_quarters = df_da.select(
-            ["TimeDK", "TimeUTC", "DayAheadPriceDKK"]
-        ).with_columns(
-            pl.col("TimeDK").str.to_datetime("%Y-%m-%dT%H:%M:%S", strict=False),
-            pl.col("TimeUTC").str.to_datetime("%Y-%m-%dT%H:%M:%S", strict=False),
+    def _realized_day(self, d: int) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+        """Return realized (quarterly, hourly, block) frames for delivery day d.
+
+        d == 0 returns the prior day (loaded by `_load_prior_day`).
+        """
+        if d == 0:
+            return self.df_prior, self.df_hourly_prior, self.df_block_prior
+        return (
+            self.df.slice(96 * (d - 1), 96),
+            self.df_hourly.slice(24 * (d - 1), 24),
+            self.df_block.slice(6 * (d - 1), 6),
         )
-        df_co2 = df_co2.with_columns(
-            pl.col("Minutes5UTC").str.to_datetime(
-                format="%Y-%m-%dT%H:%M:%S", strict=False
-            )
-        )
-        df_co2_15min = (
-            df_co2.sort("Minutes5UTC")
-            .group_by_dynamic("Minutes5UTC", every="15m")
-            .agg(pl.col("CO2Emission").mean())
-            .rename({"Minutes5UTC": "TimeUTC"})
-        )
-        df = (
-            df_quarters.join(df_co2_15min, on="TimeUTC", how="left")
-            .sort("TimeUTC")
-            .with_columns(pl.col("CO2Emission").forward_fill().backward_fill())
-        )
-
-        dk_holidays = holidays.Denmark(
-            years=range(int(self._data_start[:4]), int(self._data_end[:4]) + 1)
-        )
-        holiday_dates = set(dk_holidays.keys())
-        df = (
-            df.with_columns(
-                pl.col("TimeDK").dt.hour().alias("hour"),
-                pl.col("TimeDK").dt.weekday().alias("weekday"),
-                pl.col("TimeDK")
-                .dt.date()
-                .is_in(list(holiday_dates))
-                .alias("is_holiday"),
-            )
-            .with_columns(
-                pl.when(
-                    (pl.col("weekday") < 5)
-                    & (pl.col("hour") >= 6)
-                    & (~pl.col("is_holiday"))
-                )
-                .then(91.1)
-                .otherwise(30.4)
-                .alias("dso_tariff")
-            )
-            .with_columns(
-                (
-                    72.0
-                    + 0.0142 * (pl.col("DayAheadPriceDKK") + 26.0)
-                    + pl.col("dso_tariff")
-                ).alias("tariff_cons")
-            )
-        )
-
-        df_hours = (
-            df.with_row_index("__qidx")
-            .filter(pl.col("__qidx") % 4 == 0)
-            .select(
-                pl.col("TimeUTC").alias("TimeUTC_anchor"),
-                pl.col("TimeDK"),
-                pl.col("TimeUTC").dt.truncate("1h").alias("TimeUTC"),
-            )
-        )
-
-        if df_ffr.height > 0:
-            ffr = df_ffr.with_columns(
-                pl.col("HourUTC").str.to_datetime("%Y-%m-%dT%H:%M:%S", strict=False),
-                pl.col("FFR_PriceDKK").cast(pl.Float64),
-            ).select(
-                pl.col("HourUTC").alias("TimeUTC"),
-                pl.col("FFR_PriceDKK").alias("P_FFR"),
-            )
-            df_hours = df_hours.join(ffr, on="TimeUTC", how="left")
-        else:
-            df_hours = df_hours.with_columns(pl.lit(0.0).alias("P_FFR"))
-
-        fcr_cols = [
-            "P_FCRD_up_E",
-            "P_FCRD_up_L",
-            "P_FCRD_down_E",
-            "P_FCRD_down_L",
-            "P_FCRN_E",
-            "P_FCRN_L",
-        ]
-        if df_fcr_nd.height > 0:
-            fcr = (
-                df_fcr_nd.filter(
-                    (pl.col("PriceArea") == "DK2")
-                    & (pl.col("AuctionType").is_in(["D-1 early", "D-1 late"]))
-                )
-                .with_columns(
-                    pl.col("HourUTC").str.to_datetime(
-                        "%Y-%m-%dT%H:%M:%S", strict=False
-                    ),
-                    (pl.col("PriceTotalEUR").cast(pl.Float64) * self.EUR_TO_DKK).alias(
-                        "PriceDKK"
-                    ),
-                    pl.when(pl.col("AuctionType") == "D-1 early")
-                    .then(pl.lit("E"))
-                    .otherwise(pl.lit("L"))
-                    .alias("AuctionTag"),
-                )
-                .with_columns(
-                    (pl.col("ProductName") + "__" + pl.col("AuctionTag")).alias("Key")
-                )
-                .select(["HourUTC", "Key", "PriceDKK"])
-                .pivot(values="PriceDKK", index="HourUTC", on="Key")
-                .rename({"HourUTC": "TimeUTC"})
-            )
-            rename_map = {
-                "FCR-D upp__E": "P_FCRD_up_E",
-                "FCR-D upp__L": "P_FCRD_up_L",
-                "FCR-D ned__E": "P_FCRD_down_E",
-                "FCR-D ned__L": "P_FCRD_down_L",
-                "FCR-N__E": "P_FCRN_E",
-                "FCR-N__L": "P_FCRN_L",
-            }
-            for src, dst in rename_map.items():
-                if src in fcr.columns:
-                    fcr = fcr.rename({src: dst})
-                else:
-                    fcr = fcr.with_columns(pl.lit(0.0).alias(dst))
-            df_hours = df_hours.join(
-                fcr.select(["TimeUTC", *fcr_cols]),
-                on="TimeUTC",
-                how="left",
-            )
-        else:
-            df_hours = df_hours.with_columns(*[pl.lit(0.0).alias(c) for c in fcr_cols])
-
-        if df_mfrr.height > 0:
-            mfrr = df_mfrr.with_columns(
-                pl.col("TimeUTC").str.to_datetime("%Y-%m-%dT%H:%M:%S", strict=False),
-                pl.col("UpPriceDKK").cast(pl.Float64),
-                pl.col("DownPriceDKK").cast(pl.Float64),
-            ).select(
-                "TimeUTC",
-                pl.col("UpPriceDKK").alias("P_mFRR_up"),
-                pl.col("DownPriceDKK").alias("P_mFRR_down"),
-            )
-            df_hours = df_hours.join(mfrr, on="TimeUTC", how="left")
-        else:
-            df_hours = df_hours.with_columns(
-                pl.lit(0.0).alias("P_mFRR_up"),
-                pl.lit(0.0).alias("P_mFRR_down"),
-            )
-
-        for col in ["P_FFR", *fcr_cols, "P_mFRR_up", "P_mFRR_down"]:
-            df_hours = df_hours.with_columns(pl.col(col).fill_null(0.0))
-
-        df_blocks = (
-            df.with_row_index("__qidx")
-            .filter(pl.col("__qidx") % 16 == 0)
-            .select(
-                pl.col("TimeUTC").alias("TimeUTC_anchor"),
-                pl.col("TimeDK"),
-                pl.col("TimeUTC").dt.truncate("4h").alias("TimeUTC"),
-            )
-        )
-        if df_afrr.height > 0:
-            afrr = (
-                df_afrr.filter(pl.col("PriceArea") == "DK2")
-                .with_columns(
-                    pl.col("TimeUTC").str.to_datetime(
-                        "%Y-%m-%dT%H:%M:%S", strict=False
-                    ),
-                    pl.col("UpPriceDKK").cast(pl.Float64),
-                    pl.col("DownPriceDKK").cast(pl.Float64),
-                )
-                .select(
-                    "TimeUTC",
-                    pl.col("UpPriceDKK").alias("P_aFRR_up"),
-                    pl.col("DownPriceDKK").alias("P_aFRR_down"),
-                )
-            )
-            df_blocks = df_blocks.join(afrr, on="TimeUTC", how="left")
-        else:
-            df_blocks = df_blocks.with_columns(
-                pl.lit(0.0).alias("P_aFRR_up"),
-                pl.lit(0.0).alias("P_aFRR_down"),
-            )
-        for col in ["P_aFRR_up", "P_aFRR_down"]:
-            df_blocks = df_blocks.with_columns(pl.col(col).fill_null(0.0))
-
-        return df, df_hours, df_blocks
-
-    # ----------------------------------------------------- price slicing
 
     @staticmethod
-    def _quarter_to_hour(q: int) -> int:
-        return (q - 1) // 4 + 1
+    def _opt_float(v) -> float:
+        return float(v) if v is not None else 0.0
 
-    @staticmethod
-    def _quarter_to_block(q: int) -> int:
-        return (q - 1) // 16 + 1
+    # ----------- Constraint overrides with numerical tolerance -----------
+    # The bodies are identical to Model 3 except a small NUM_TOL slack is
+    # added on the right-hand side so that values forwarded between rolling
+    # solves do not produce spurious infeasibility from floating-point drift
+    # in the LP solver's reported optimum.
 
-    def _slice_prices(
-        self, day_offset: int, use_forecast: bool
-    ) -> dict[str, list[float]]:
-        """Return the 3-day window of price/CO2 series the operator sees at the
-        time of bidding.
+    def equation_8(self, model, d):
+        quarters_in_day = range(96 * (d - 1) + 1, 96 * d + 1)
+        return (
+            sum(self.delta_t * model.da_buy[q] for q in quarters_in_day)
+            <= model.n_cycles * model.bat_mwh + self.NUM_TOL
+        )
 
-        ``day_offset`` is the index of delivery day D in the loaded ``df``
-        (counted in days from ``self._data_start``). With the loader pulling
-        ``start_date - 1 day``, the first delivery day (``start_date``) has
-        ``day_offset = 1``.
+    def equation_ler_fcrd_up(self, model, q):
+        h = self.quarter_to_hour(q)
+        b = self.quarter_to_block(q)
+        return (
+            model.soc_min
+            + (model.fcrd_up_E[h] + model.fcrd_up_L[h]) * self.E_FCRD
+            + model.afrr_up[b] * self.E_aFRR
+            + model.mfrr_up[h] * self.E_mFRR
+            - self.NUM_TOL
+            <= model.soc[q]
+        )
 
-        With ``use_forecast=True`` the prices are 24h-lagged (the operator's
-        forecast = previous day's realized prices, applied to D, D+1 and D+2).
-        """
-        if use_forecast:
-            p_day = day_offset - 1
-        else:
-            p_day = day_offset
+    def equation_ler_fcrd_down(self, model, q):
+        h = self.quarter_to_hour(q)
+        b = self.quarter_to_block(q)
+        return (
+            model.soc_max
+            - (model.fcrd_down_E[h] + model.fcrd_down_L[h]) * self.E_FCRD
+            - model.afrr_down[b] * self.E_aFRR
+            - model.mfrr_down[h] * self.E_mFRR
+            + self.NUM_TOL
+            >= model.soc[q]
+        )
 
-        q_start = 96 * p_day
-        h_start = 24 * p_day
-        b_start = 6 * p_day
+    def equation_ler_fcrn_up(self, model, q):
+        h = self.quarter_to_hour(q)
+        b = self.quarter_to_block(q)
+        return (
+            model.soc_min
+            + (model.fcrn_E[h] + model.fcrn_L[h]) * self.E_FCRN
+            + model.afrr_up[b] * self.E_aFRR
+            + model.mfrr_up[h] * self.E_mFRR
+            - self.NUM_TOL
+            <= model.soc[q]
+        )
 
-        slice_q = self.df.slice(q_start, 288)
-        slice_h = self.df_hourly.slice(h_start, 72)
-        slice_b = self.df_block.slice(b_start, 18)
+    def equation_ler_fcrn_down(self, model, q):
+        h = self.quarter_to_hour(q)
+        b = self.quarter_to_block(q)
+        return (
+            model.soc_max
+            - (model.fcrn_E[h] + model.fcrn_L[h]) * self.E_FCRN
+            - model.afrr_down[b] * self.E_aFRR
+            - model.mfrr_down[h] * self.E_mFRR
+            + self.NUM_TOL
+            >= model.soc[q]
+        )
 
-        return {
-            "da_price": slice_q["DayAheadPriceDKK"].to_list(),
-            "co2": slice_q["CO2Emission"].to_list(),
-            "tariff_cons": slice_q["tariff_cons"].to_list(),
-            **{
-                f"p_{prod}": slice_h[col].to_list()
-                for prod, col in self.HOURLY_PRICE_COLS.items()
-            },
-            **{
-                f"p_{prod}": slice_b[col].to_list()
-                for prod, col in self.BLOCK_PRICE_COLS.items()
-            },
-        }
+    def equation_power_discharge(self, model, q):
+        h = self.quarter_to_hour(q)
+        b = self.quarter_to_block(q)
+        return (
+            model.da_sell[q]
+            + model.ffr[h]
+            + model.fcrd_up_E[h]
+            + model.fcrd_up_L[h]
+            + model.fcrn_E[h]
+            + model.fcrn_L[h]
+            + model.afrr_up[b]
+            + model.mfrr_up[h]
+            <= model.bat_discharge_eff * model.bat_mw + self.NUM_TOL
+        )
 
-    # ------------------------------------------------------ model build
+    def equation_power_charge(self, model, q):
+        h = self.quarter_to_hour(q)
+        b = self.quarter_to_block(q)
+        return (
+            model.da_buy[q]
+            + model.fcrd_down_E[h]
+            + model.fcrd_down_L[h]
+            + model.fcrn_E[h]
+            + model.fcrn_L[h]
+            + model.afrr_down[b]
+            + model.mfrr_down[h]
+            <= model.bat_mw + self.NUM_TOL
+        )
 
-    def _build_window_model(
+    # --------------------- Sequential solve ---------------------
+
+    def _solve_window(
         self,
-        prices: dict[str, list[float]],
-        fixed_bids: dict[str, dict[int, float]],
-        lambda_profit: float,
-        lambda_co2: float,
-    ) -> pyo.ConcreteModel:
-        """Build a 3-day LP using the supplied price dictionary.
+        delivery_day: int,
+        current_soc_initial: float,
+        per_day_fixed: dict,
+        use_forecast: bool,
+        auction_name: str = "?",
+    ):
+        """Solve one auction's LP window starting at `delivery_day`.
 
-        Variables listed in ``fixed_bids`` are pinned (these are the
-        delivery-day commitments accumulated from earlier auction pools).
+        The window covers days [delivery_day, delivery_day+2], clipped at the
+        end of the horizon. All variables already in `per_day_fixed` (the
+        delivery day's bids fixed by earlier auctions) are pinned via
+        Pyomo's `.fix()`. SoC continuity across delivery days is handled by
+        passing `current_soc_initial` (= end-of-prior-day SoC).
         """
-        m = pyo.ConcreteModel()
-        Q, D, H, B = 288, 3, 72, 18
-        m.quarters = pyo.RangeSet(1, Q)
-        m.days = pyo.RangeSet(1, D)
-        m.hours = pyo.RangeSet(1, H)
-        m.blocks = pyo.RangeSet(1, B)
+        Q_total = len(self.df)
+
+        q_start = 96 * (delivery_day - 1) + 1
+        q_end = min(96 * (delivery_day + self.lookahead_days), Q_total)
+        h_start = (q_start - 1) // 4 + 1
+        h_end = q_end // 4
+        b_start = (q_start - 1) // 16 + 1
+        b_end = q_end // 16
+        d_start = delivery_day
+        d_end = (q_end - 1) // 96 + 1
+
+        end_at_horizon = q_end == Q_total
+
+        prior_q, prior_h, prior_b = (
+            self._realized_day(delivery_day - 1) if use_forecast else (None, None, None)
+        )
+
+        model = pyo.ConcreteModel()
+        model.quarters = pyo.RangeSet(q_start, q_end)
+        model.hours = pyo.RangeSet(h_start, h_end)
+        model.blocks = pyo.RangeSet(b_start, b_end)
+        model.days = pyo.RangeSet(d_start, d_end)
 
         # Scalar parameters
-        m.bat_mw = pyo.Param(initialize=self.bat_mw)
-        m.bat_mwh = pyo.Param(initialize=self.bat_mwh)
-        m.bat_charge_eff = pyo.Param(initialize=self.bat_charge_eff)
-        m.bat_discharge_eff = pyo.Param(initialize=self.bat_discharge_eff)
-        m.soc_initial = pyo.Param(initialize=self.soc_initial)
-        m.soc_min = pyo.Param(initialize=self.soc_min)
-        m.soc_max = pyo.Param(initialize=self.soc_max)
-        m.lam = pyo.Param(initialize=self.soc_quarterly_loss)
-        m.tariff_prod = pyo.Param(initialize=self.tariff_prod)
-        m.cycle_cost = pyo.Param(initialize=self.cycle_cost)
-        m.n_cycles = pyo.Param(initialize=self.n_cycles)
+        model.bat_mw = pyo.Param(initialize=self.bat_mw)
+        model.bat_mwh = pyo.Param(initialize=self.bat_mwh)
+        model.bat_charge_eff = pyo.Param(initialize=self.bat_charge_eff)
+        model.bat_discharge_eff = pyo.Param(initialize=self.bat_discharge_eff)
+        model.soc_initial = pyo.Param(initialize=current_soc_initial, mutable=True)
+        model.soc_min = pyo.Param(initialize=self.soc_min)
+        model.soc_max = pyo.Param(initialize=self.soc_max)
+        model.lam = pyo.Param(initialize=self.soc_quarterly_loss)
+        model.tariff_prod = pyo.Param(initialize=self.tariff_prod)
+        model.cycle_cost = pyo.Param(initialize=self.cycle_cost)
+        model.n_cycles = pyo.Param(initialize=self.n_cycles)
+        model.lambda_profit = pyo.Param(initialize=self.lambda_profit)
+        model.lambda_co2 = pyo.Param(initialize=self.lambda_co2)
 
-        def q_param(name: str) -> pyo.Param:
-            vals = prices[name]
-            return pyo.Param(
-                m.quarters,
-                initialize={
-                    q: float(vals[q - 1]) if vals[q - 1] is not None else 0.0
-                    for q in range(1, Q + 1)
-                },
-            )
+        # Quarterly series
+        tariff_cons_init: dict[int, float] = {}
+        da_price_init: dict[int, float] = {}
+        gamma_init: dict[int, float] = {}
+        for q in range(q_start, q_end + 1):
+            tod_q = (q - 1) % 96
+            tariff_cons_init[q] = float(self.df["tariff_cons"][q - 1])
+            if use_forecast:
+                da_price_init[q] = float(prior_q["DayAheadPriceDKK"][tod_q])
+                gamma_init[q] = float(prior_q["CO2Emission"][tod_q])
+            else:
+                da_price_init[q] = float(self.df["DayAheadPriceDKK"][q - 1])
+                gamma_init[q] = float(self.df["CO2Emission"][q - 1])
+        model.tariff_cons = pyo.Param(model.quarters, initialize=tariff_cons_init)
+        model.da_price = pyo.Param(model.quarters, initialize=da_price_init)
+        model.gamma = pyo.Param(model.quarters, initialize=gamma_init)
 
-        def h_param(name: str) -> pyo.Param:
-            vals = prices[name]
-            return pyo.Param(
-                m.hours,
-                initialize={
-                    h: float(vals[h - 1]) if vals[h - 1] is not None else 0.0
-                    for h in range(1, H + 1)
-                },
-            )
+        # Hourly capacity prices
+        for var_name, col in self.HOURLY_PRICE_COLS.items():
+            attr = f"p_{var_name}" if not var_name.startswith("ffr") else "p_ffr"
+            # Map var name -> parameter attribute name used inside Model 3's
+            # rules (e.g. p_fcrd_up_E, p_fcrn_E, p_mfrr_up, p_ffr).
+            init = {}
+            for h in range(h_start, h_end + 1):
+                tod_h = (h - 1) % 24
+                if use_forecast:
+                    init[h] = self._opt_float(prior_h[col][tod_h])
+                else:
+                    init[h] = self._opt_float(self.df_hourly[col][h - 1])
+            setattr(model, attr, pyo.Param(model.hours, initialize=init))
 
-        def b_param(name: str) -> pyo.Param:
-            vals = prices[name]
-            return pyo.Param(
-                m.blocks,
-                initialize={
-                    b: float(vals[b - 1]) if vals[b - 1] is not None else 0.0
-                    for b in range(1, B + 1)
-                },
-            )
-
-        m.da_price = q_param("da_price")
-        m.gamma = q_param("co2")
-        m.tariff_cons = q_param("tariff_cons")
-        for prod in self.HOURLY_PRODUCTS:
-            setattr(m, f"p_{prod}", h_param(f"p_{prod}"))
-        for prod in self.BLOCK_PRODUCTS:
-            setattr(m, f"p_{prod}", b_param(f"p_{prod}"))
+        # Block capacity prices
+        for var_name, col in self.BLOCK_PRICE_COLS.items():
+            attr = f"p_{var_name}"
+            init = {}
+            for b in range(b_start, b_end + 1):
+                tod_b = (b - 1) % 6
+                if use_forecast:
+                    init[b] = self._opt_float(prior_b[col][tod_b])
+                else:
+                    init[b] = self._opt_float(self.df_block[col][b - 1])
+            setattr(model, attr, pyo.Param(model.blocks, initialize=init))
 
         # Decision variables
-        m.da_buy = pyo.Var(m.quarters, bounds=(0, self.bat_mw))
-        m.da_sell = pyo.Var(
-            m.quarters, bounds=(0, self.bat_discharge_eff * self.bat_mw)
+        model.da_buy = pyo.Var(model.quarters, bounds=self.equation_2)
+        model.da_sell = pyo.Var(model.quarters, bounds=self.equation_3)
+        model.soc = pyo.Var(model.quarters, bounds=self.equation_4)
+        model.ffr = pyo.Var(model.hours, bounds=(0, None))
+        model.fcrd_up_E = pyo.Var(model.hours, bounds=(0, None))
+        model.fcrd_up_L = pyo.Var(model.hours, bounds=(0, None))
+        model.fcrd_down_E = pyo.Var(model.hours, bounds=(0, None))
+        model.fcrd_down_L = pyo.Var(model.hours, bounds=(0, None))
+        model.fcrn_E = pyo.Var(model.hours, bounds=(0, None))
+        model.fcrn_L = pyo.Var(model.hours, bounds=(0, None))
+        model.mfrr_up = pyo.Var(model.hours, bounds=(0, None))
+        model.mfrr_down = pyo.Var(model.hours, bounds=(0, None))
+        model.afrr_up = pyo.Var(model.blocks, bounds=(0, None))
+        model.afrr_down = pyo.Var(model.blocks, bounds=(0, None))
+
+        # Pin already-decided bids for this delivery day. Instead of a hard
+        # .fix(value), we narrow the variable's bounds to a small interval
+        # [value - PIN_SLACK, value + PIN_SLACK]. The LP can then resolve
+        # tiny inconsistencies between successive solves (GLPK's reported
+        # optimum is accurate only within its primal feasibility tolerance,
+        # roughly 1e-7, but the SoC recurrence amplifies that drift), while
+        # the bid is still effectively committed at the auction's chosen
+        # level.
+        for (var_name, idx), value in per_day_fixed.items():
+            var = getattr(model, var_name)
+            if idx not in var:
+                continue
+            v = var[idx]
+            lo = max(0.0, value - self.PIN_SLACK)
+            hi = value + self.PIN_SLACK
+            v.setlb(lo)
+            v.setub(hi)
+
+        # Objective
+        model.objective = pyo.Objective(expr=self.equation_1(model), sense=pyo.maximize)
+
+        # Inherited Model 3 constraints
+        model.eq5 = pyo.Constraint(model.quarters, rule=self.equation_5)
+        model.eq6 = pyo.Constraint(model.quarters, rule=self.equation_6)
+        if end_at_horizon:
+            # Close the SoC cycle only at the very end of the full horizon.
+            soc_target = self.soc_initial * self.bat_mwh
+
+            def _eq7_rule(model_, q):
+                if q != Q_total:
+                    return pyo.Constraint.Skip
+                return model_.soc[q] == soc_target
+
+            model.eq7 = pyo.Constraint(model.quarters, rule=_eq7_rule)
+        model.eq8 = pyo.Constraint(model.days, rule=self.equation_8)
+        model.eq_ler_fcrd_up = pyo.Constraint(
+            model.quarters, rule=self.equation_ler_fcrd_up
         )
-        m.soc = pyo.Var(m.quarters, bounds=(self.soc_min, self.soc_max))
-        for prod in self.HOURLY_PRODUCTS:
-            setattr(m, prod, pyo.Var(m.hours, bounds=(0, None)))
-        for prod in self.BLOCK_PRODUCTS:
-            setattr(m, prod, pyo.Var(m.blocks, bounds=(0, None)))
-
-        dt = self.delta_t
-
-        # --- Objective ---
-        da_profit = sum(
-            dt
-            * (
-                m.da_sell[q] * (m.da_price[q] - m.tariff_prod)
-                - m.da_buy[q] * (m.da_price[q] + m.tariff_cons[q])
-                - m.cycle_cost * (m.da_buy[q] + m.da_sell[q])
-            )
-            for q in m.quarters
+        model.eq_ler_fcrd_down = pyo.Constraint(
+            model.quarters, rule=self.equation_ler_fcrd_down
         )
-        hourly_rev = sum(
-            m.ffr[h] * m.p_ffr[h]
-            + m.fcrd_up_E[h] * m.p_fcrd_up_E[h]
-            + m.fcrd_up_L[h] * m.p_fcrd_up_L[h]
-            + m.fcrd_down_E[h] * m.p_fcrd_down_E[h]
-            + m.fcrd_down_L[h] * m.p_fcrd_down_L[h]
-            + m.fcrn_E[h] * m.p_fcrn_E[h]
-            + m.fcrn_L[h] * m.p_fcrn_L[h]
-            + m.mfrr_up[h] * m.p_mfrr_up[h]
-            + m.mfrr_down[h] * m.p_mfrr_down[h]
-            for h in m.hours
+        model.eq_ler_fcrn_up = pyo.Constraint(
+            model.quarters, rule=self.equation_ler_fcrn_up
         )
-        block_rev = sum(
-            m.afrr_up[b] * m.p_afrr_up[b] + m.afrr_down[b] * m.p_afrr_down[b]
-            for b in m.blocks
+        model.eq_ler_fcrn_down = pyo.Constraint(
+            model.quarters, rule=self.equation_ler_fcrn_down
         )
-        co2 = sum(dt * m.gamma[q] * (m.da_buy[q] - m.da_sell[q]) for q in m.quarters)
-        m.objective = pyo.Objective(
-            expr=lambda_profit * (da_profit + hourly_rev + block_rev)
-            - lambda_co2 * co2,
-            sense=pyo.maximize,
+        model.eq_power_discharge = pyo.Constraint(
+            model.quarters, rule=self.equation_power_discharge
+        )
+        model.eq_power_charge = pyo.Constraint(
+            model.quarters, rule=self.equation_power_charge
         )
 
-        # --- SoC dynamics ---
-        def soc_dyn_rule(m, q):
-            if q == 1:
-                prev = m.soc_initial
-            else:
-                prev = m.soc[q - 1]
-            return m.soc[q] == (
-                (1 - m.lam) * prev
-                + dt
-                * (m.bat_charge_eff * m.da_buy[q] - m.da_sell[q] / m.bat_discharge_eff)
-            )
-
-        m.eq_soc_dynamics = pyo.Constraint(m.quarters, rule=soc_dyn_rule)
-
-        def soc_final_rule(m):
-            return m.soc[Q] == m.soc_initial
-
-        m.eq_soc_final = pyo.Constraint(rule=soc_final_rule)
-
-        # --- Cycle constraint per day ---
-        def cycle_rule(m, d):
-            qs = range(96 * (d - 1) + 1, 96 * d + 1)
-            return sum(dt * m.da_buy[q] for q in qs) <= m.n_cycles * m.bat_mwh
-
-        m.eq_cycle = pyo.Constraint(m.days, rule=cycle_rule)
-
-        # --- LER buffer constraints ---
-        def ler_fcrd_up(m, q):
-            h = self._quarter_to_hour(q)
-            b = self._quarter_to_block(q)
-            return (
-                m.soc_min
-                + (m.fcrd_up_E[h] + m.fcrd_up_L[h]) * self.E_FCRD
-                + m.afrr_up[b] * self.E_aFRR
-                + m.mfrr_up[h] * self.E_mFRR
-                <= m.soc[q]
-            )
-
-        def ler_fcrd_down(m, q):
-            h = self._quarter_to_hour(q)
-            b = self._quarter_to_block(q)
-            return (
-                m.soc_max
-                - (m.fcrd_down_E[h] + m.fcrd_down_L[h]) * self.E_FCRD
-                - m.afrr_down[b] * self.E_aFRR
-                - m.mfrr_down[h] * self.E_mFRR
-                >= m.soc[q]
-            )
-
-        def ler_fcrn_up(m, q):
-            h = self._quarter_to_hour(q)
-            b = self._quarter_to_block(q)
-            return (
-                m.soc_min
-                + (m.fcrn_E[h] + m.fcrn_L[h]) * self.E_FCRN
-                + m.afrr_up[b] * self.E_aFRR
-                + m.mfrr_up[h] * self.E_mFRR
-                <= m.soc[q]
-            )
-
-        def ler_fcrn_down(m, q):
-            h = self._quarter_to_hour(q)
-            b = self._quarter_to_block(q)
-            return (
-                m.soc_max
-                - (m.fcrn_E[h] + m.fcrn_L[h]) * self.E_FCRN
-                - m.afrr_down[b] * self.E_aFRR
-                - m.mfrr_down[h] * self.E_mFRR
-                >= m.soc[q]
-            )
-
-        m.eq_ler_fcrd_up = pyo.Constraint(m.quarters, rule=ler_fcrd_up)
-        m.eq_ler_fcrd_down = pyo.Constraint(m.quarters, rule=ler_fcrd_down)
-        m.eq_ler_fcrn_up = pyo.Constraint(m.quarters, rule=ler_fcrn_up)
-        m.eq_ler_fcrn_down = pyo.Constraint(m.quarters, rule=ler_fcrn_down)
-
-        # --- Power-flow constraints ---
-        def power_discharge(m, q):
-            h = self._quarter_to_hour(q)
-            b = self._quarter_to_block(q)
-            return (
-                m.da_sell[q]
-                + m.ffr[h]
-                + m.fcrd_up_E[h]
-                + m.fcrd_up_L[h]
-                + m.fcrn_E[h]
-                + m.fcrn_L[h]
-                + m.afrr_up[b]
-                + m.mfrr_up[h]
-                <= m.bat_discharge_eff * m.bat_mw
-            )
-
-        def power_charge(m, q):
-            h = self._quarter_to_hour(q)
-            b = self._quarter_to_block(q)
-            return (
-                m.da_buy[q]
-                + m.fcrd_down_E[h]
-                + m.fcrd_down_L[h]
-                + m.fcrn_E[h]
-                + m.fcrn_L[h]
-                + m.afrr_down[b]
-                + m.mfrr_down[h]
-                <= m.bat_mw
-            )
-
-        m.eq_power_discharge = pyo.Constraint(m.quarters, rule=power_discharge)
-        m.eq_power_charge = pyo.Constraint(m.quarters, rule=power_charge)
-
-        # --- Fix already-committed delivery-day bids ---
-        # Delivery day occupies q=1..96, h=1..24, b=1..6 within the window.
-        for product, idx_to_val in fixed_bids.items():
-            var = getattr(m, product)
-            for idx, val in idx_to_val.items():
-                var[idx].fix(float(val))
-
-        return m
-
-    # ----------------------------------------------------- pool / day
-
-    def _solve_pool(
-        self,
-        day_offset: int,
-        pool: int,
-        fixed_bids: dict[str, dict[int, float]],
-        use_forecast: bool,
-        lambda_profit: float,
-        lambda_co2: float,
-    ) -> dict[str, dict[int, float]]:
-        """Solve one auction pool. Returns the updated ``fixed_bids`` dict with
-        the products auctioned in this pool added for the delivery day."""
-        prices = self._slice_prices(day_offset, use_forecast)
-        model = self._build_window_model(prices, fixed_bids, lambda_profit, lambda_co2)
         solver = pyo.SolverFactory("glpk")
-        solver.solve(model)
-
-        for product, idx_type in self.POOL_PRODUCTS[pool]:
-            if idx_type == "q":
-                indices = range(1, 97)
-            elif idx_type == "h":
-                indices = range(1, 25)
-            else:
-                indices = range(1, 7)
-            var = getattr(model, product)
-            fixed_bids.setdefault(product, {})
-            for idx in indices:
-                v = float(pyo.value(var[idx]))
-                # Clamp tiny LP solver numerical noise back inside the
-                # variable's bounds so it can be safely re-fixed next pool.
-                lb = var[idx].lb
-                ub = var[idx].ub
-                if lb is not None and v < lb:
-                    v = lb
-                if ub is not None and v > ub:
-                    v = ub
-                fixed_bids[product][idx] = v
-
-        return fixed_bids
-
-    def _simulate_day(
-        self,
-        day_offset: int,
-        use_forecast: bool,
-        lambda_profit: float,
-        lambda_co2: float,
-    ) -> dict[str, dict[int, float]]:
-        fixed_bids: dict[str, dict[int, float]] = {}
-        for pool in range(1, 6):
-            fixed_bids = self._solve_pool(
-                day_offset,
-                pool,
-                fixed_bids,
-                use_forecast,
-                lambda_profit,
-                lambda_co2,
+        results = solver.solve(model)
+        status = results.solver.status
+        condition = results.solver.termination_condition
+        if (
+            status != pyo.SolverStatus.ok
+            or condition != pyo.TerminationCondition.optimal
+        ):
+            debug_path = Path(
+                f"results/scenario_3/debug/d{delivery_day:02d}_{auction_name}.lp"
             )
-        return fixed_bids
+            debug_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                model.write(
+                    str(debug_path),
+                    io_options={"symbolic_solver_labels": True},
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"  (could not write LP file: {exc})")
+            raise RuntimeError(
+                f"GLPK failed for delivery day {delivery_day}, auction "
+                f"{auction_name} (status={status}, termination={condition}, "
+                f"soc_initial={current_soc_initial:.6f}, "
+                f"#fixed_bids={len(per_day_fixed)}, LP written to {debug_path})."
+            )
+        return model
 
-    # --------------------------------------------------- realized eval
-
-    def _evaluate_realized(
+    def _capture_day_bids(
         self,
-        committed_per_day: list[dict[str, dict[int, float]]],
-        day_offsets: list[int],
-    ) -> tuple[float, float]:
-        """Compute realized profit and CO2 from committed bids using the
-        realized series."""
-        total_profit = 0.0
-        total_co2 = 0.0
+        model,
+        delivery_day: int,
+        products: list[str],
+        per_day_fixed: dict,
+        global_bids: dict,
+    ) -> None:
+        """Pull this auction's day-of-delivery bids out of the solved model
+        and append them to both the per-day fixing dict and the global
+        accumulator used for objective evaluation.
+        """
+        day_q_start = 96 * (delivery_day - 1) + 1
+        day_q_end = 96 * delivery_day
+        day_h_start = 24 * (delivery_day - 1) + 1
+        day_h_end = 24 * delivery_day
+        day_b_start = 6 * (delivery_day - 1) + 1
+        day_b_end = 6 * delivery_day
+
+        # Strict upper bounds on the LP variables. These are only used to
+        # clean up bid values reported externally (objective evaluation,
+        # Excel output); the values pinned to subsequent solves keep their
+        # raw LP magnitude to avoid breaking the SoC / LER cascade.
+        upper_bounds = {
+            "da_buy": self.bat_mw,
+            "da_sell": self.bat_discharge_eff * self.bat_mw,
+        }
+
+        for product in products:
+            var = getattr(model, product)
+            if product in self.QUARTERLY_VARS:
+                rng = range(day_q_start, day_q_end + 1)
+            elif product in self.HOURLY_VARS:
+                rng = range(day_h_start, day_h_end + 1)
+            elif product in self.BLOCK_VARS:
+                rng = range(day_b_start, day_b_end + 1)
+            else:
+                raise ValueError(f"Unknown product {product}")
+            upper = upper_bounds.get(product)
+            for idx in rng:
+                v_raw = pyo.value(var[idx])
+                # Sanitised copy used for reporting only.
+                v_clean = max(0.0, v_raw)
+                if upper is not None and v_clean > upper:
+                    v_clean = upper
+                # Forward the exact LP value to keep downstream LPs feasible.
+                per_day_fixed[(product, idx)] = v_raw
+                global_bids[(product, idx)] = v_clean
+
+    def solve_sequential(self, use_forecast: bool) -> dict:
+        """Run the sequential five-auction model over the full horizon.
+
+        Returns a dict keyed by (product_name, global_index) -> bid value.
+        """
+        Q_total = len(self.df)
+        D_total = Q_total // 96
+
+        global_bids: dict = {}
+        current_soc_initial = self.soc_initial * self.bat_mwh
+
+        for d in range(1, D_total + 1):
+            per_day_fixed: dict = {}
+            last_model = None
+            for auction_name, products in self.AUCTIONS:
+                model = self._solve_window(
+                    d,
+                    current_soc_initial,
+                    per_day_fixed,
+                    use_forecast,
+                    auction_name=auction_name,
+                )
+                self._capture_day_bids(model, d, products, per_day_fixed, global_bids)
+                last_model = model
+            # Hand off SoC: end-of-day-d SoC becomes start of day d+1, clipped
+            # to the feasible SoC band to absorb GLPK numerical noise.
+            end_q = 96 * d
+            current_soc_initial = pyo.value(last_model.soc[end_q])
+            current_soc_initial = min(
+                max(current_soc_initial, self.soc_min), self.soc_max
+            )
+            print(
+                f"  Day {d:02d}/{D_total} done. End-of-day SoC = "
+                f"{current_soc_initial:.3f} MWh"
+            )
+        return global_bids
+
+    # --------------------- Objective evaluation ---------------------
+
+    def _extract_objectives_from_bids(self, bids: dict) -> tuple[float, float, dict]:
+        """Aggregate profit and CO2 over the full horizon using realized
+        prices and CO2 intensities, regardless of which prices were used
+        during optimization. This makes the three frontiers directly
+        comparable in objective terms.
+        """
+        Q = len(self.df)
+        H = Q // 4
+        B = Q // 16
         dt = self.delta_t
 
-        for d_off, committed in zip(day_offsets, committed_per_day):
-            q0 = 96 * d_off
-            h0 = 24 * d_off
-            b0 = 6 * d_off
+        def q_bid(name, q):
+            return bids.get((name, q), 0.0)
 
-            da_p = self.df["DayAheadPriceDKK"][q0 : q0 + 96].to_list()
-            tariff_c = self.df["tariff_cons"][q0 : q0 + 96].to_list()
-            gamma = self.df["CO2Emission"][q0 : q0 + 96].to_list()
+        def h_bid(name, h):
+            return bids.get((name, h), 0.0)
 
-            da_buy = committed["da_buy"]
-            da_sell = committed["da_sell"]
+        def b_bid(name, b):
+            return bids.get((name, b), 0.0)
 
-            da_revenue = dt * sum(da_sell[q + 1] * da_p[q] for q in range(96))
-            prod_tariff = dt * sum(da_sell[q + 1] * self.tariff_prod for q in range(96))
-            da_cost = dt * sum(da_buy[q + 1] * da_p[q] for q in range(96))
-            cons_tariff = dt * sum(da_buy[q + 1] * tariff_c[q] for q in range(96))
-            degradation = (
-                dt
-                * self.cycle_cost
-                * sum(da_buy[q + 1] + da_sell[q + 1] for q in range(96))
-            )
-            da_profit = da_revenue - prod_tariff - da_cost - cons_tariff - degradation
+        da_buy = [q_bid("da_buy", q) for q in range(1, Q + 1)]
+        da_sell = [q_bid("da_sell", q) for q in range(1, Q + 1)]
+        da_price = self.df["DayAheadPriceDKK"].to_list()
+        tariff_cons = self.df["tariff_cons"].to_list()
+        gamma = self.df["CO2Emission"].to_list()
 
-            hourly_rev = 0.0
-            for prod, col in self.HOURLY_PRICE_COLS.items():
-                prices = self.df_hourly[col][h0 : h0 + 24].to_list()
-                bids = committed[prod]
-                hourly_rev += sum(bids[h + 1] * prices[h] for h in range(24))
+        da_revenue = dt * sum(s * p for s, p in zip(da_sell, da_price))
+        prod_tariff = dt * sum(s * self.tariff_prod for s in da_sell)
+        da_cost = dt * sum(b * p for b, p in zip(da_buy, da_price))
+        cons_tariff = dt * sum(b * t for b, t in zip(da_buy, tariff_cons))
+        degradation = dt * self.cycle_cost * sum(b + s for b, s in zip(da_buy, da_sell))
+        da_profit = da_revenue - prod_tariff - da_cost - cons_tariff - degradation
 
-            block_rev = 0.0
-            for prod, col in self.BLOCK_PRICE_COLS.items():
-                prices = self.df_block[col][b0 : b0 + 6].to_list()
-                bids = committed[prod]
-                block_rev += sum(bids[b + 1] * prices[b] for b in range(6))
-
-            co2 = dt * sum(
-                gamma[q] * (da_buy[q + 1] - da_sell[q + 1]) for q in range(96)
+        def hourly_rev(name, col):
+            return sum(
+                h_bid(name, h) * self._opt_float(self.df_hourly[col][h - 1])
+                for h in range(1, H + 1)
             )
 
-            total_profit += da_profit + hourly_rev + block_rev
-            total_co2 += co2
+        def block_rev(name, col):
+            return sum(
+                b_bid(name, b) * self._opt_float(self.df_block[col][b - 1])
+                for b in range(1, B + 1)
+            )
 
-        return total_profit, total_co2
+        ffr_rev = hourly_rev("ffr", "P_FFR")
+        fcrd_up_E_rev = hourly_rev("fcrd_up_E", "P_FCRD_up_E")
+        fcrd_up_L_rev = hourly_rev("fcrd_up_L", "P_FCRD_up_L")
+        fcrd_down_E_rev = hourly_rev("fcrd_down_E", "P_FCRD_down_E")
+        fcrd_down_L_rev = hourly_rev("fcrd_down_L", "P_FCRD_down_L")
+        fcrn_E_rev = hourly_rev("fcrn_E", "P_FCRN_E")
+        fcrn_L_rev = hourly_rev("fcrn_L", "P_FCRN_L")
+        mfrr_up_rev = hourly_rev("mfrr_up", "P_mFRR_up")
+        mfrr_down_rev = hourly_rev("mfrr_down", "P_mFRR_down")
+        afrr_up_rev = block_rev("afrr_up", "P_aFRR_up")
+        afrr_down_rev = block_rev("afrr_down", "P_aFRR_down")
 
-    # -------------------------------------------------------- pareto
-
-    def _delivery_day_offsets(self) -> list[int]:
-        """List of day offsets (relative to ``self._data_start``) covering
-        every delivery day in [start_date, end_date]."""
-        sd = datetime.fromisoformat(self.start_date).date()
-        ed = datetime.fromisoformat(self.end_date).date()
-        ds = datetime.fromisoformat(self._data_start).date()
-        n_days = (ed - sd).days + 1
-        first_offset = (sd - ds).days
-        return [first_offset + i for i in range(n_days)]
-
-    def pareto_frontier(self, use_forecast: bool) -> list[dict]:
-        """101 weight pairs: extremes plus 99 evenly spaced pairs in between."""
-        weight_pairs = (
-            [(0.9999, 0.0001)]
-            + [(round(1.0 - i * 0.01, 2), round(i * 0.01, 2)) for i in range(1, 100)]
-            + [(0.0001, 0.9999)]
+        reserve_rev = (
+            ffr_rev
+            + fcrd_up_E_rev
+            + fcrd_up_L_rev
+            + fcrd_down_E_rev
+            + fcrd_down_L_rev
+            + fcrn_E_rev
+            + fcrn_L_rev
+            + mfrr_up_rev
+            + mfrr_down_rev
+            + afrr_up_rev
+            + afrr_down_rev
         )
-        offsets = self._delivery_day_offsets()
-        label = "forecast" if use_forecast else "realized"
+        profit = da_profit + reserve_rev
+        co2 = sum(dt * g * (b - s) for g, b, s in zip(gamma, da_buy, da_sell))
+
+        breakdown = {
+            "da_revenue": da_revenue,
+            "prod_tariff": -prod_tariff,
+            "da_cost": -da_cost,
+            "cons_tariff": -cons_tariff,
+            "degradation": -degradation,
+            "da_profit": da_profit,
+            "ffr_revenue": ffr_rev,
+            "fcrd_up_E_revenue": fcrd_up_E_rev,
+            "fcrd_up_L_revenue": fcrd_up_L_rev,
+            "fcrd_down_E_revenue": fcrd_down_E_rev,
+            "fcrd_down_L_revenue": fcrd_down_L_rev,
+            "fcrn_E_revenue": fcrn_E_rev,
+            "fcrn_L_revenue": fcrn_L_rev,
+            "afrr_up_revenue": afrr_up_rev,
+            "afrr_down_revenue": afrr_down_rev,
+            "mfrr_up_revenue": mfrr_up_rev,
+            "mfrr_down_revenue": mfrr_down_rev,
+            "reserve_revenue": reserve_rev,
+            "profit": profit,
+            "co2": co2,
+        }
+        return profit, co2, breakdown
+
+    # --------------------- Frontier sweeps ---------------------
+
+    def pareto_frontier_sequential(self, use_forecast: bool) -> list[dict]:
+        mode = "forecast" if use_forecast else "realized"
         results: list[dict] = []
-        for lp, lc in weight_pairs:
-            print(
-                f"\n[{label}] lambda_profit={lp:.2f} lambda_co2={lc:.2f}"
-                f" -- simulating {len(offsets)} delivery days"
-            )
-            committed_per_day: list[dict[str, dict[int, float]]] = []
-            for d_off in offsets:
-                committed = self._simulate_day(d_off, use_forecast, lp, lc)
-                committed_per_day.append(committed)
-                print(f"  day_offset={d_off} done")
-            profit, co2 = self._evaluate_realized(committed_per_day, offsets)
-            print(f"  total realized profit = {profit:>12.2f} DKK")
-            print(f"  total realized CO2    = {co2:>12.4f} kg")
+        for lp, lc in self.PARETO_WEIGHTS:
+            self.lambda_profit = lp
+            self.lambda_co2 = lc
+            print(f"\n[{mode}] λ_profit={lp:.4f}, λ_co2={lc:.4f}")
+            bids = self.solve_sequential(use_forecast=use_forecast)
+            profit, co2, _ = self._extract_objectives_from_bids(bids)
+            print(f"  Total profit: {profit:>12.2f} DKK")
+            print(f"  CO2:          {co2:>12.2f} kg")
             results.append(
                 {
                     "lambda_profit": lp,
@@ -809,77 +646,213 @@ class SequentialModel:
             )
         return results
 
-    # ------------------------------------------------------- output
-
-    def save_results(
-        self,
-        forecast_results: list[dict],
-        realized_results: list[dict],
-    ) -> None:
-        out = Path(self.results_file_path)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        wb = xlsxwriter.Workbook(str(out))
-        for name, results in [
-            ("forecast", forecast_results),
-            ("realized", realized_results),
-        ]:
-            df = pl.DataFrame(
+    def run_model3_baseline(self) -> list[dict]:
+        """Re-run Model 3 with the same weight pairs as Model 4 to build
+        an apples-to-apples perfect-foresight baseline.
+        """
+        baseline = Model3(
+            start_date=self.start_date,
+            end_date=self.end_date,
+            bat_mw=self.bat_mw,
+            bat_mwh=self.bat_mwh,
+            df=self.df,
+            df_hourly=self.df_hourly,
+            df_block=self.df_block,
+        )
+        results: list[dict] = []
+        for lp, lc in self.PARETO_WEIGHTS:
+            baseline.lambda_profit = lp
+            baseline.lambda_co2 = lc
+            print(f"\n[model3] λ_profit={lp:.4f}, λ_co2={lc:.4f}")
+            solved = baseline.solve()
+            profit, co2, _ = baseline._extract_objectives(solved)
+            results.append(
                 {
-                    "lambda_profit": [r["lambda_profit"] for r in results],
-                    "lambda_co2": [r["lambda_co2"] for r in results],
-                    "profit_dkk": [r["profit"] for r in results],
-                    "co2_kg": [r["co2"] for r in results],
+                    "lambda_profit": lp,
+                    "lambda_co2": lc,
+                    "profit": profit,
+                    "co2": co2,
                 }
             )
-            df.write_excel(wb, worksheet=name)
-        wb.close()
-        print(f"\nResults saved to {out}")
+        return results
 
-    def visualize_pareto_frontier(
-        self,
-        forecast_results: list[dict],
-        realized_results: list[dict],
-        model3_results: list[dict] | None = None,
+    @staticmethod
+    def save_results(results: list[dict], path: str) -> None:
+        out = Path(path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame(
+            {
+                "lambda_profit": [r["lambda_profit"] for r in results],
+                "lambda_co2": [r["lambda_co2"] for r in results],
+                "profit_dkk": [r["profit"] for r in results],
+                "co2_kg": [r["co2"] for r in results],
+            }
+        ).write_excel(out)
+        print(f"Saved to {out}")
+
+    @staticmethod
+    def load_results(path: str) -> list[dict]:
+        df = pl.read_excel(path)
+        return [
+            {
+                "lambda_profit": r["lambda_profit"],
+                "lambda_co2": r["lambda_co2"],
+                "profit": r["profit_dkk"],
+                "co2": r["co2_kg"],
+            }
+            for r in df.iter_rows(named=True)
+        ]
+
+    # --------------------- Visualisation ---------------------
+
+    @staticmethod
+    def visualize_three_frontiers(
+        baseline: list[dict],
+        realized: list[dict],
+        forecast: list[dict],
+        out_file: str = "results/scenario_3/pareto_comparison.png",
     ) -> None:
-        fig = go.Figure()
+        all_profits = [
+            r["profit"] for results in (baseline, realized, forecast) for r in results
+        ]
+        all_co2s = [
+            r["co2"] for results in (baseline, realized, forecast) for r in results
+        ]
+        x_max = max(all_profits) * 1.05
+        y_min = min(all_co2s) * 1.05 if min(all_co2s) < 0 else -1
 
-        if model3_results:
+        fig = go.Figure()
+        fig.add_shape(
+            type="rect",
+            xref="x",
+            yref="y",
+            x0=0,
+            x1=x_max,
+            y0=y_min,
+            y1=0,
+            fillcolor="rgba(0, 200, 100, 0.15)",
+            line_width=0,
+            layer="below",
+        )
+        fig.add_annotation(
+            x=x_max,
+            y=y_min,
+            text="Profit > 0 & CO₂ < 0",
+            showarrow=False,
+            font=dict(size=10, color="green"),
+            xanchor="right",
+            yanchor="bottom",
+        )
+
+        for results, name, color in [
+            (baseline, "Model 3 (perfect foresight)", "seagreen"),
+            (realized, "Model 4 (realized prices)", "steelblue"),
+            (forecast, "Model 4 (forecast prices)", "darkorange"),
+        ]:
+            profits = [r["profit"] for r in results]
+            co2s = [r["co2"] for r in results]
+            labels = [
+                f"λ=({r['lambda_profit']:.2f}, {r['lambda_co2']:.2f})" for r in results
+            ]
             fig.add_trace(
                 go.Scatter(
-                    x=[r["profit"] for r in model3_results],
-                    y=[r["co2"] for r in model3_results],
+                    x=profits,
+                    y=co2s,
                     mode="lines+markers",
-                    name="Model 3 (perfect foresight)",
-                    marker=dict(size=7, color="seagreen"),
-                    line=dict(color="seagreen", width=1.5),
+                    name=name,
+                    text=labels,
+                    hovertemplate=(
+                        "%{text}<br>Profit: %{x:.2f} DKK"
+                        "<br>CO₂: %{y:.4f} kg<extra></extra>"
+                    ),
+                    marker=dict(size=7, color=color),
+                    line=dict(color=color, width=1.5),
                 )
             )
 
-        fig.add_trace(
-            go.Scatter(
-                x=[r["profit"] for r in realized_results],
-                y=[r["co2"] for r in realized_results],
-                mode="lines+markers",
-                name="Sequential (realized prices)",
-                marker=dict(size=7, color="steelblue"),
-                line=dict(color="steelblue", width=1.5),
-            )
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=[r["profit"] for r in forecast_results],
-                y=[r["co2"] for r in forecast_results],
-                mode="lines+markers",
-                name="Sequential (forecasted prices)",
-                marker=dict(size=7, color="indianred"),
-                line=dict(color="indianred", width=1.5),
-            )
-        )
         fig.update_layout(
             xaxis_title="Profit (DKK)",
-            yaxis_title="CO2 Emissions (kg)",
+            yaxis_title="CO₂ Emissions (kg)",
             template="plotly_white",
-            margin=dict(l=0, r=0, t=20, b=10),
+            legend=dict(
+                orientation="h",
+                yanchor="top",
+                y=-0.075,
+                xanchor="center",
+                x=0.5,
+            ),
+            margin=dict(l=0, r=0, t=40, b=10),
+        )
+
+        out = Path(out_file)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        fig.show()
+        fig.write_image(str(out))
+        print(f"Pareto comparison saved to {out}")
+
+    @staticmethod
+    def visualize_vpi(
+        baseline: list[dict],
+        realized: list[dict],
+        forecast: list[dict],
+        out_file: str = "results/scenario_3/vpi.png",
+    ) -> None:
+        """Compare profit and CO₂ across the 11 weight pairs for all three
+        setups. The vertical gap between curves at any λ_profit gives the
+        value of perfect information (between Model 4 forecast and Model 4
+        realized) and the cost of sequential commitment (between Model 4
+        realized and Model 3 perfect foresight).
+        """
+        fig = make_subplots(
+            rows=2,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.08,
+            subplot_titles=("Profit (DKK)", "CO₂ Emissions (kg)"),
+        )
+
+        x_labels = [f"{r['lambda_profit']:.2f}" for r in baseline]
+
+        for results, name, color in [
+            (baseline, "Model 3 (perfect foresight)", "seagreen"),
+            (realized, "Model 4 (realized prices)", "steelblue"),
+            (forecast, "Model 4 (forecast prices)", "darkorange"),
+        ]:
+            profits = [r["profit"] for r in results]
+            co2s = [r["co2"] for r in results]
+            fig.add_trace(
+                go.Scatter(
+                    x=x_labels,
+                    y=profits,
+                    mode="lines+markers",
+                    name=name,
+                    legendgroup=name,
+                    marker=dict(size=7, color=color),
+                    line=dict(color=color, width=1.5),
+                ),
+                row=1,
+                col=1,
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=x_labels,
+                    y=co2s,
+                    mode="lines+markers",
+                    name=name,
+                    legendgroup=name,
+                    showlegend=False,
+                    marker=dict(size=7, color=color),
+                    line=dict(color=color, width=1.5),
+                ),
+                row=2,
+                col=1,
+            )
+
+        fig.update_xaxes(title_text="λ_profit", row=2, col=1)
+        fig.update_yaxes(title_text="Profit (DKK)", row=1, col=1)
+        fig.update_yaxes(title_text="CO₂ (kg)", row=2, col=1)
+        fig.update_layout(
+            template="plotly_white",
             legend=dict(
                 orientation="h",
                 yanchor="top",
@@ -887,42 +860,249 @@ class SequentialModel:
                 xanchor="center",
                 x=0.5,
             ),
+            margin=dict(l=0, r=0, t=40, b=10),
         )
+
+        out = Path(out_file)
+        out.parent.mkdir(parents=True, exist_ok=True)
         fig.show()
-        fig.write_image("results/price_uncertainty_pareto.png")
+        fig.write_image(str(out))
+        print(f"VPI figure saved to {out}")
 
     @staticmethod
-    def _load_model3_results() -> list[dict] | None:
-        """Best-effort load of the Model 3 frontier from results/model_3.xlsx."""
-        path = Path("results/model_3.xlsx")
-        if not path.exists():
-            return None
-        df = pl.read_excel(path)
-        return [
-            {
-                "lambda_profit": float(r["lambda_profit"]),
-                "lambda_co2": float(r["lambda_co2"]),
-                "profit": float(r["profit_dkk"]),
-                "co2": float(r["co2_kg"]),
-            }
-            for r in df.iter_rows(named=True)
-        ]
+    def visualize_two_frontiers(
+        baseline: list[dict],
+        forecast: list[dict],
+        out_file: str = "results/scenario_3/pareto_comparison.png",
+    ) -> None:
+        """Compare the Model 3 perfect-foresight frontier and the Model 4
+        forecast-price sequential frontier on one Pareto chart.
+        """
+        all_profits = [r["profit"] for results in (baseline, forecast) for r in results]
+        all_co2s = [r["co2"] for results in (baseline, forecast) for r in results]
+        x_max = max(all_profits) * 1.05
+        y_min = min(all_co2s) * 1.05 if min(all_co2s) < 0 else -1
 
-    def run(self) -> None:
-        print("\n========== Sequential model: REALIZED prices ==========")
-        realized_results = self.pareto_frontier(use_forecast=False)
-        print("\n========== Sequential model: FORECASTED prices ==========")
-        forecast_results = self.pareto_frontier(use_forecast=True)
-        self.save_results(forecast_results, realized_results)
-        model3_results = self._load_model3_results()
-        self.visualize_pareto_frontier(
-            forecast_results, realized_results, model3_results
+        fig = go.Figure()
+        fig.add_shape(
+            type="rect",
+            xref="x",
+            yref="y",
+            x0=0,
+            x1=x_max,
+            y0=y_min,
+            y1=0,
+            fillcolor="rgba(0, 200, 100, 0.15)",
+            line_width=0,
+            layer="below",
         )
+        fig.add_annotation(
+            x=x_max,
+            y=y_min,
+            text="Profit > 0 & CO₂ < 0",
+            showarrow=False,
+            font=dict(size=10, color="green"),
+            xanchor="right",
+            yanchor="bottom",
+        )
+
+        for results, name, color in [
+            (baseline, "Model 3 (perfect foresight)", "seagreen"),
+            (forecast, "Model 4 (forecast prices)", "darkorange"),
+        ]:
+            profits = [r["profit"] for r in results]
+            co2s = [r["co2"] for r in results]
+            labels = [
+                f"λ=({r['lambda_profit']:.2f}, {r['lambda_co2']:.2f})" for r in results
+            ]
+            fig.add_trace(
+                go.Scatter(
+                    x=profits,
+                    y=co2s,
+                    mode="lines+markers",
+                    name=name,
+                    text=labels,
+                    hovertemplate=(
+                        "%{text}<br>Profit: %{x:.2f} DKK"
+                        "<br>CO₂: %{y:.4f} kg<extra></extra>"
+                    ),
+                    marker=dict(size=6, color=color),
+                    line=dict(color=color, width=1.5),
+                )
+            )
+
+        fig.update_layout(
+            xaxis_title="Profit (DKK)",
+            yaxis_title="CO₂ Emissions (kg)",
+            template="plotly_white",
+            legend=dict(
+                orientation="h",
+                yanchor="top",
+                y=-0.075,
+                xanchor="center",
+                x=0.5,
+            ),
+            margin=dict(l=0, r=0, t=40, b=10),
+        )
+
+        out = Path(out_file)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        fig.show()
+        fig.write_image(str(out))
+        print(f"Pareto comparison saved to {out}")
+
+    @staticmethod
+    def visualize_lookahead_sweep(
+        baseline: list[dict],
+        frontiers: list[tuple[int, list[dict]]],
+        title: str,
+        out_file: str,
+    ) -> None:
+        """Plot the Model 3 perfect-foresight frontier together with one
+        Model 4 frontier per look-ahead horizon, on a single Pareto chart.
+        """
+        all_profits = [r["profit"] for r in baseline] + [
+            r["profit"] for _, results in frontiers for r in results
+        ]
+        all_co2s = [r["co2"] for r in baseline] + [
+            r["co2"] for _, results in frontiers for r in results
+        ]
+        x_max = max(all_profits) * 1.05
+        y_min = min(all_co2s) * 1.05 if min(all_co2s) < 0 else -1
+
+        fig = go.Figure()
+        fig.add_shape(
+            type="rect",
+            xref="x",
+            yref="y",
+            x0=0,
+            x1=x_max,
+            y0=y_min,
+            y1=0,
+            fillcolor="rgba(0, 200, 100, 0.15)",
+            line_width=0,
+            layer="below",
+        )
+
+        palette = ["steelblue", "darkorange", "crimson", "purple", "teal"]
+        curves: list[tuple[list[dict], str, str]] = [
+            (baseline, "Model 3 (perfect foresight)", "seagreen")
+        ]
+        for i, (la, results) in enumerate(frontiers):
+            label = f"Model 4 (look-ahead = {la} day{'s' if la != 1 else ''})"
+            curves.append((results, label, palette[i % len(palette)]))
+
+        for results, name, color in curves:
+            profits = [r["profit"] for r in results]
+            co2s = [r["co2"] for r in results]
+            labels = [
+                f"λ=({r['lambda_profit']:.2f}, {r['lambda_co2']:.2f})" for r in results
+            ]
+            fig.add_trace(
+                go.Scatter(
+                    x=profits,
+                    y=co2s,
+                    mode="lines+markers",
+                    name=name,
+                    text=labels,
+                    hovertemplate=(
+                        "%{text}<br>Profit: %{x:.2f} DKK"
+                        "<br>CO₂: %{y:.4f} kg<extra></extra>"
+                    ),
+                    marker=dict(size=7, color=color),
+                    line=dict(color=color, width=1.5),
+                )
+            )
+
+        fig.update_layout(
+            title=title,
+            xaxis_title="Profit (DKK)",
+            yaxis_title="CO₂ Emissions (kg)",
+            template="plotly_white",
+            legend=dict(
+                orientation="h",
+                yanchor="top",
+                y=-0.075,
+                xanchor="center",
+                x=0.5,
+            ),
+            margin=dict(l=0, r=0, t=40, b=10),
+        )
+
+        out = Path(out_file)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        fig.show()
+        fig.write_image(str(out))
+        print(f"Look-ahead comparison saved to {out}")
+
+
+def run_debug_schedules(start: str = "2026-04-01", end: str = "2026-04-30") -> None:
+    """Re-solve the realized-price sequential model (look-ahead = 2) at the
+    (0.9999, 0.0001) weight pair and dump per-day production schedules, plus
+    the Model 3 perfect-foresight schedule for the same weights.
+    """
+    m4 = Model4(start, end, lookahead_days=2)
+    m4.lambda_profit = 0.9999
+    m4.lambda_co2 = 0.0001
+    debug_dir = "results/scenario_3/debug_schedules/realized_w0.9999_0.0001"
+    Path(debug_dir).mkdir(parents=True, exist_ok=True)
+    print(f"\n[debug] Sequential realized, λ=(0.9999, 0.0001). Writing to {debug_dir}")
+    m4.solve_sequential(use_forecast=False, debug_schedule_dir=debug_dir)
+
+    m3 = Model3(start_date=start, end_date=end)
+    m3.lambda_profit = 0.9999
+    m3.lambda_co2 = 0.0001
+    print("\n[debug] Model 3 perfect-foresight, λ=(0.9999, 0.0001)")
+    solved = m3.solve()
+    bids, soc, q_max = m3.bids_and_soc_from_model(solved)
+    m3_path = "results/scenario_3/debug_schedules/model3_w0.9999_0.0001.xlsx"
+    m3.write_schedule_excel(bids, soc, q_max, m3_path)
+    print(f"Model 3 schedule saved to {m3_path}")
 
 
 if __name__ == "__main__":
-    m = SequentialModel(
-        start_date="2026-04-01",
-        end_date="2026-04-30",
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "debug":
+        run_debug_schedules()
+        sys.exit(0)
+
+    START = "2026-04-01"
+    END = "2026-04-30"
+    LOOKAHEAD = 2
+
+    # Prefer Model 3's own 101-point sweep if it has already been generated;
+    # otherwise fall back to a scenario_3-local copy that we generate here.
+    model3_path = "results/model_3/model_3.xlsx"
+    baseline_path = "results/scenario_3/model_3_101pts.xlsx"
+    forecast_path = f"results/scenario_3/forecast_la{LOOKAHEAD}_101pts.xlsx"
+
+    baseline_cached = Path(model3_path).exists() or Path(baseline_path).exists()
+    needs_model = (not baseline_cached) or (not Path(forecast_path).exists())
+
+    m = Model4(START, END, lookahead_days=LOOKAHEAD) if needs_model else None
+
+    if Path(model3_path).exists():
+        print(f"Loading cached Model 3 baseline from {model3_path}")
+        baseline_results = Model4.load_results(model3_path)
+    elif Path(baseline_path).exists():
+        print(f"Loading cached Model 3 baseline from {baseline_path}")
+        baseline_results = Model4.load_results(baseline_path)
+    else:
+        assert m is not None
+        baseline_results = m.run_model3_baseline()
+        Model4.save_results(baseline_results, baseline_path)
+
+    if Path(forecast_path).exists():
+        forecast_results = Model4.load_results(forecast_path)
+        print(f"Loaded cached forecast frontier from {forecast_path}")
+    else:
+        assert m is not None
+        forecast_results = m.pareto_frontier_sequential(use_forecast=True)
+        Model4.save_results(forecast_results, forecast_path)
+
+    Model4.visualize_two_frontiers(
+        baseline_results,
+        forecast_results,
+        out_file="results/scenario_3/pareto_comparison.png",
     )
-    m.run()
