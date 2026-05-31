@@ -608,7 +608,7 @@ class Model4(Model3):
         return results
 
     def run_model3_baseline(self) -> list[dict]:
-        """Re-run Model 3 with the same weight pairs as Model 4 to build
+        """Re-run Model 3 with the same weight pairs as Model 3 (Sequential) to build
         an apples-to-apples perfect-foresight baseline.
         """
         baseline = Model3(
@@ -706,8 +706,8 @@ class Model4(Model3):
 
         for results, name, color in [
             (baseline, "Model 3 (perfect foresight)", "seagreen"),
-            (realized, "Model 4 (realized prices)", "steelblue"),
-            (forecast, "Model 4 (forecast prices)", "darkorange"),
+            (realized, "Model 3 (Sequential) (realized prices)", "steelblue"),
+            (forecast, "Model 3 (Sequential) (forecast prices)", "darkorange"),
         ]:
             profits = [r["profit"] for r in results]
             co2s = [r["co2"] for r in results]
@@ -759,8 +759,8 @@ class Model4(Model3):
     ) -> None:
         """Compare profit and CO₂ across the 11 weight pairs for all three
         setups. The vertical gap between curves at any λ_profit gives the
-        value of perfect information (between Model 4 forecast and Model 4
-        realized) and the cost of sequential commitment (between Model 4
+        value of perfect information (between Model 3 (Sequential) forecast and Model 3 (Sequential)
+        realized) and the cost of sequential commitment (between Model 3 (Sequential)
         realized and Model 3 perfect foresight).
         """
         fig = make_subplots(
@@ -775,8 +775,8 @@ class Model4(Model3):
 
         for results, name, color in [
             (baseline, "Model 3 (perfect foresight)", "seagreen"),
-            (realized, "Model 4 (realized prices)", "steelblue"),
-            (forecast, "Model 4 (forecast prices)", "darkorange"),
+            (realized, "Model 3 (Sequential) (realized prices)", "steelblue"),
+            (forecast, "Model 3 (Sequential) (forecast prices)", "darkorange"),
         ]:
             profits = [r["profit"] for r in results]
             co2s = [r["co2"] for r in results]
@@ -835,7 +835,7 @@ class Model4(Model3):
         forecast: list[dict],
         out_file: str = "results/scenario_3/pareto_comparison.png",
     ) -> None:
-        """Compare the Model 3 perfect-foresight frontier and the Model 4
+        """Compare the Model 3 perfect-foresight frontier and the Model 3 (Sequential)
         forecast-price sequential frontier on one Pareto chart.
         """
         all_profits = [r["profit"] for results in (baseline, forecast) for r in results]
@@ -868,7 +868,7 @@ class Model4(Model3):
 
         for results, name, color in [
             (baseline, "Model 3 (perfect foresight)", "seagreen"),
-            (forecast, "Model 4 (forecast prices)", "darkorange"),
+            (forecast, "Model 3 - Sequential (forecast prices)", "darkorange"),
         ]:
             profits = [r["profit"] for r in results]
             co2s = [r["co2"] for r in results]
@@ -919,7 +919,7 @@ class Model4(Model3):
         out_file: str,
     ) -> None:
         """Plot the Model 3 perfect-foresight frontier together with one
-        Model 4 frontier per look-ahead horizon, on a single Pareto chart.
+        Model 3 (Sequential) frontier per look-ahead horizon, on a single Pareto chart.
         """
         all_profits = [r["profit"] for r in baseline] + [
             r["profit"] for _, results in frontiers for r in results
@@ -949,7 +949,9 @@ class Model4(Model3):
             (baseline, "Model 3 (perfect foresight)", "seagreen")
         ]
         for i, (la, results) in enumerate(frontiers):
-            label = f"Model 4 (look-ahead = {la} day{'s' if la != 1 else ''})"
+            label = (
+                f"Model 3 (Sequential) (look-ahead = {la} day{'s' if la != 1 else ''})"
+            )
             curves.append((results, label, palette[i % len(palette)]))
 
         for results, name, color in curves:
@@ -997,7 +999,7 @@ class Model4(Model3):
 
 
 def run_debug_schedules(start: str = "2026-04-01", end: str = "2026-05-01") -> None:
-    """Re-solve the realized-price sequential model (look-ahead = 2) at the
+    """Re-solve the Model 3 (Sequential) realized-price model (look-ahead = 2) at the
     (0.9999, 0.0001) weight pair and dump per-day production schedules, plus
     the Model 3 perfect-foresight schedule for the same weights.
     """
