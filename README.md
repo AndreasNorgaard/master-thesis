@@ -31,6 +31,9 @@ python -m analysis.scenario_1
 
 # Run Scenario Analysis 2: Price scenarios
 python -m analysis.scenario_2
+
+# Run Scenario Analysis 3: Uncertain prices
+python -m analysis.scenario_3
 ```
 
 ## Common Commands

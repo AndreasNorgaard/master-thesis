@@ -9,42 +9,45 @@ from analysis.model_3 import Model3
 START_DATE = "2026-04-01"
 END_DATE = "2026-05-01"
 
+# Pareto weight pairs: profit extreme, 99 intermediate, CO2 extreme
+PARETO_WEIGHT_PAIRS = (
+    [(0.9999, 0.0001)]
+    + [(round(1.0 - i * 0.01, 2), round(i * 0.01, 2)) for i in range(1, 100)]
+    + [(0.0001, 0.9999)]
+)
+
 CONFIGS = [
     (2, 2),
     (2, 4),
     (2, 8),
 ]
 
+# (label, breakdown key, row type: "normal" | "subtotal" | "total")
 BREAKDOWN_ROWS = [
-    ("Day-ahead Revenue", "da_revenue"),
-    ("Production Tariffs", "prod_tariff"),
-    ("Day-ahead Cost", "da_cost"),
-    ("Consumption Tariffs", "cons_tariff"),
-    ("Degradation Cost", "degradation"),
-    ("FFR Revenue", "ffr_revenue"),
-    ("FCR-D up Revenue (early)", "fcrd_up_E_revenue"),
-    ("FCR-D up Revenue (late)", "fcrd_up_L_revenue"),
-    ("FCR-D down Revenue (early)", "fcrd_down_E_revenue"),
-    ("FCR-D down Revenue (late)", "fcrd_down_L_revenue"),
-    ("FCR-N Revenue (early)", "fcrn_E_revenue"),
-    ("FCR-N Revenue (late)", "fcrn_L_revenue"),
-    ("aFRR up Revenue", "afrr_up_revenue"),
-    ("aFRR down Revenue", "afrr_down_revenue"),
-    ("mFRR up Revenue", "mfrr_up_revenue"),
-    ("mFRR down Revenue", "mfrr_down_revenue"),
-    ("Profit", "profit"),
+    ("Day-ahead Revenue", "da_revenue", "normal"),
+    ("Production Tariffs", "prod_tariff", "normal"),
+    ("Day-ahead Cost", "da_cost", "normal"),
+    ("Consumption Tariffs", "cons_tariff", "normal"),
+    ("Degradation Cost", "degradation", "normal"),
+    ("Day-ahead Profit", "da_profit", "subtotal"),
+    ("FFR Revenue", "ffr_revenue", "normal"),
+    ("FCR-D up Revenue (early)", "fcrd_up_E_revenue", "normal"),
+    ("FCR-D up Revenue (late)", "fcrd_up_L_revenue", "normal"),
+    ("FCR-D down Revenue (early)", "fcrd_down_E_revenue", "normal"),
+    ("FCR-D down Revenue (late)", "fcrd_down_L_revenue", "normal"),
+    ("FCR-N Revenue (early)", "fcrn_E_revenue", "normal"),
+    ("FCR-N Revenue (late)", "fcrn_L_revenue", "normal"),
+    ("aFRR up Revenue", "afrr_up_revenue", "normal"),
+    ("aFRR down Revenue", "afrr_down_revenue", "normal"),
+    ("mFRR up Revenue", "mfrr_up_revenue", "normal"),
+    ("mFRR down Revenue", "mfrr_down_revenue", "normal"),
+    ("Ancillary Service Profit", "reserve_revenue", "subtotal"),
+    ("Profit", "profit", "total"),
 ]
 
 
 def _row_value(breakdown: dict, key: str) -> float:
     return breakdown[key]
-
-
-PARETO_WEIGHT_PAIRS = (
-    [(0.9999, 0.0001)]
-    + [(round(1.0 - i * 0.01, 2), round(i * 0.01, 2)) for i in range(1, 100)]
-    + [(0.0001, 0.9999)]
-)
 
 
 def config_labels(configs: list[tuple[int, int]]) -> list[str]:
@@ -84,7 +87,9 @@ def print_breakdown_table(
     print(header)
     print(sep)
 
-    for row_label, key in BREAKDOWN_ROWS:
+    for row_label, key, row_type in BREAKDOWN_ROWS:
+        if row_type in ("subtotal", "total"):
+            print(sep)
         row = f"{row_label:<{label_w}}"
         for bd in breakdowns:
             row += f"{_row_value(bd, key):>{col_w},.2f}  "
@@ -113,6 +118,23 @@ def save_breakdown_excel(
         {"bold": True, "num_format": "#,##0.00", "border": 1, "bg_color": "#F2F2F2"}
     )
     bold_label_fmt = wb.add_format({"bold": True, "border": 1, "bg_color": "#F2F2F2"})
+    italic_num_fmt = wb.add_format(
+        {"italic": True, "num_format": "#,##0.00", "border": 1, "bg_color": "#F9F9F9"}
+    )
+    italic_label_fmt = wb.add_format(
+        {"italic": True, "border": 1, "bg_color": "#F9F9F9"}
+    )
+
+    label_formats = {
+        "normal": label_fmt,
+        "subtotal": italic_label_fmt,
+        "total": bold_label_fmt,
+    }
+    num_formats = {
+        "normal": num_fmt,
+        "subtotal": italic_num_fmt,
+        "total": bold_num_fmt,
+    }
 
     for sheet_name, breakdowns in sheets:
         ws = wb.add_worksheet(sheet_name[:31])
@@ -121,14 +143,21 @@ def save_breakdown_excel(
         for col, (mw, mwh) in enumerate(configs, start=1):
             ws.write(0, col, f"{mw} MW / {mwh} MWh", header_fmt)
 
-        for row_idx, (label, key) in enumerate(BREAKDOWN_ROWS, start=1):
-            is_total = label == "Profit"
-            lf = bold_label_fmt if is_total else label_fmt
-            nf = bold_num_fmt if is_total else num_fmt
+        for row_idx, (label, key, row_type) in enumerate(BREAKDOWN_ROWS, start=1):
+            lf = label_formats[row_type]
+            nf = num_formats[row_type]
             ws.write(row_idx, 0, label, lf)
             for col, breakdown in enumerate(breakdowns, start=1):
                 value = _row_value(breakdown, key)
                 ws.write(row_idx, col, value, nf)
+
+        note_row = len(BREAKDOWN_ROWS) + 2
+        ws.write(
+            note_row,
+            0,
+            "Note: Results based on Model 3 with "
+            "lambda_profit=0.9999, lambda_co2=0.0001. All values in DKK.",
+        )
 
         ws.set_column(0, 0, 28)
         ws.set_column(1, len(configs), 18)
