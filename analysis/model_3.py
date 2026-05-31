@@ -23,7 +23,6 @@ class Model3:
         bat_mwh: float = 4,
         df: pl.DataFrame | None = None,
         df_hourly: pl.DataFrame | None = None,
-        df_block: pl.DataFrame | None = None,
     ):
         self.results_file_path = "results/model_3/model_3.xlsx"
 
@@ -46,22 +45,21 @@ class Model3:
 
         # Tariffs (Appendix B of thesis, DKK/MWh)
         if self.start_date == "2026-01-01":
-            self.tariff_prod = 16.2  # Winter tariff
+            self.tariff_prod = 15.0  # Winter tariff
         else:
-            self.tariff_prod = 15.5  # Summer tariff
+            self.tariff_prod = 14.5  # Summer tariff
 
         # Endurance requirements (hours)
         self.E_FCRD = 1.0 / 3.0  # 20 minutes
         self.E_FCRN = 1.0
-        self.E_aFRR = 4.0
+        self.E_aFRR = 1.0  # aFRR procured hourly, 1-hour sustained delivery
         self.E_mFRR = 0.25  # 15 minutes
 
         # Either reuse caller-provided frames (e.g. so a parent model can
         # share its already-fetched dataset) or fetch from the API now.
-        if df is not None and df_hourly is not None and df_block is not None:
+        if df is not None and df_hourly is not None:
             self.df = df
             self.df_hourly = df_hourly
-            self.df_block = df_block
         else:
             self.load_data()
 
@@ -77,7 +75,7 @@ class Model3:
         df_fcr_nd = client.fcr_nd_capacity(write_to_file=False)
         df_afrr = client.afrr_capacity(write_to_file=False)
         df_mfrr = client.mfrr_capacity(write_to_file=False)
-        self.df, self.df_hourly, self.df_block = self.create_dataset(
+        self.df, self.df_hourly = self.create_dataset(
             df_da, df_co2, df_ffr, df_fcr_nd, df_afrr, df_mfrr
         )
         if write_to_file:
@@ -86,7 +84,6 @@ class Model3:
             wb = xlsxwriter.Workbook(str(out))
             self.df.write_excel(wb, worksheet="quarterly")
             self.df_hourly.write_excel(wb, worksheet="hourly")
-            self.df_block.write_excel(wb, worksheet="blocks")
             wb.close()
 
     def create_dataset(
@@ -97,11 +94,11 @@ class Model3:
         df_fcr_nd: pl.DataFrame,
         df_afrr: pl.DataFrame,
         df_mfrr: pl.DataFrame,
-    ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    ) -> tuple[pl.DataFrame, pl.DataFrame]:
         """
         Builds the quarterly base dataset (DA prices, CO2, tariffs) plus the
-        hourly and 4-hour-block reserve capacity price tables aligned to the
-        same horizon as the quarterly index.
+        hourly reserve capacity price table (FFR, FCR-D, FCR-N, aFRR, mFRR)
+        aligned to the same horizon as the quarterly index.
         """
         # ---------- Quarterly base (identical to Model 2) ----------
         df_quarters = df_da.select(
@@ -137,12 +134,12 @@ class Model3:
                 pl.when((pl.col("weekday") < 5) & (~pl.col("is_holiday")))
                 .then(
                     pl.when(pl.col("hour") < 6)
-                    .then(30.9)
+                    .then(24.7)
                     .when(pl.col("hour") < 21)
-                    .then(185.3)
-                    .otherwise(92.6)
+                    .then(148.2)
+                    .otherwise(7.41)
                 )
-                .otherwise(pl.when(pl.col("hour") < 6).then(30.9).otherwise(92.6))
+                .otherwise(pl.when(pl.col("hour") < 6).then(24.7).otherwise(7.41))
             )
         else:
             dso_tariff_expr = (
@@ -151,8 +148,8 @@ class Model3:
                     & (pl.col("hour") >= 6)
                     & (~pl.col("is_holiday"))
                 )
-                .then(91.1)
-                .otherwise(30.4)
+                .then(72.9)
+                .otherwise(24.3)
             )
 
         df = (
@@ -275,29 +272,7 @@ class Model3:
                 pl.lit(0.0).alias("P_mFRR_down"),
             )
 
-        # Fill gaps with 0 (no clearing -> zero revenue, never blocks bidding)
-        for col in [
-            "P_FFR",
-            *fcr_cols,
-            "P_mFRR_up",
-            "P_mFRR_down",
-        ]:
-            df_hours = df_hours.with_columns(pl.col(col).fill_null(0.0))
-
-        # ---------- 4-hour block skeleton ----------
-        # Anchor blocks to every 16th quarter so model.block=b <-> quarters
-        # 16(b-1)+1..16b. The aFRR price for block b is the price of the market
-        # block containing the anchor's start time.
-        df_blocks = (
-            df.with_row_index("__qidx")
-            .filter(pl.col("__qidx") % 16 == 0)
-            .select(
-                pl.col("TimeUTC").alias("TimeUTC_anchor"),
-                pl.col("TimeDK"),
-                pl.col("TimeUTC").dt.truncate("4h").alias("TimeUTC"),
-            )
-        )
-
+        # aFRR (hourly, DKK prices). Procured on an hourly basis in DK2.
         if df_afrr.height > 0:
             afrr = (
                 df_afrr.filter(pl.col("PriceArea") == "DK2")
@@ -314,25 +289,29 @@ class Model3:
                     pl.col("DownPriceDKK").alias("P_aFRR_down"),
                 )
             )
-            df_blocks = df_blocks.join(afrr, on="TimeUTC", how="left")
+            df_hours = df_hours.join(afrr, on="TimeUTC", how="left")
         else:
-            df_blocks = df_blocks.with_columns(
+            df_hours = df_hours.with_columns(
                 pl.lit(0.0).alias("P_aFRR_up"),
                 pl.lit(0.0).alias("P_aFRR_down"),
             )
 
-        for col in ["P_aFRR_up", "P_aFRR_down"]:
-            df_blocks = df_blocks.with_columns(pl.col(col).fill_null(0.0))
+        # Fill gaps with 0 (no clearing -> zero revenue, never blocks bidding)
+        for col in [
+            "P_FFR",
+            *fcr_cols,
+            "P_mFRR_up",
+            "P_mFRR_down",
+            "P_aFRR_up",
+            "P_aFRR_down",
+        ]:
+            df_hours = df_hours.with_columns(pl.col(col).fill_null(0.0))
 
-        return df, df_hours, df_blocks
+        return df, df_hours
 
     @staticmethod
     def quarter_to_hour(q: int) -> int:
         return (q - 1) // 4 + 1
-
-    @staticmethod
-    def quarter_to_block(q: int) -> int:
-        return (q - 1) // 16 + 1
 
     # ----------------------- Objective -----------------------
 
@@ -358,23 +337,17 @@ class Model3:
             + model.fcrd_down_L[h] * model.p_fcrd_down_L[h]
             + model.fcrn_E[h] * model.p_fcrn_E[h]
             + model.fcrn_L[h] * model.p_fcrn_L[h]
+            + model.afrr_up[h] * model.p_afrr_up[h]
+            + model.afrr_down[h] * model.p_afrr_down[h]
             + model.mfrr_up[h] * model.p_mfrr_up[h]
             + model.mfrr_down[h] * model.p_mfrr_down[h]
             for h in model.hours
-        )
-        block_rev = sum(
-            model.afrr_up[b] * model.p_afrr_up[b]
-            + model.afrr_down[b] * model.p_afrr_down[b]
-            for b in model.blocks
         )
         co2 = sum(
             self.delta_t * model.gamma[q] * (model.da_buy[q] - model.da_sell[q])
             for q in model.quarters
         )
-        return (
-            model.lambda_profit * (da_profit + hourly_rev + block_rev)
-            - model.lambda_co2 * co2
-        )
+        return model.lambda_profit * (da_profit + hourly_rev) - model.lambda_co2 * co2
 
     # --------------- Constraints inherited from Model 2 ---------------
 
@@ -428,11 +401,10 @@ class Model3:
     def equation_ler_fcrd_up(self, model, q):
         """LER buffer with FCR-D up (E+L) + aFRR up + mFRR up."""
         h = self.quarter_to_hour(q)
-        b = self.quarter_to_block(q)
         return (
             model.soc_min
             + (model.fcrd_up_E[h] + model.fcrd_up_L[h]) * self.E_FCRD
-            + model.afrr_up[b] * self.E_aFRR
+            + model.afrr_up[h] * self.E_aFRR
             + model.mfrr_up[h] * self.E_mFRR
             <= model.soc[q]
         )
@@ -440,11 +412,10 @@ class Model3:
     def equation_ler_fcrd_down(self, model, q):
         """LER buffer with FCR-D down (E+L) + aFRR down + mFRR down."""
         h = self.quarter_to_hour(q)
-        b = self.quarter_to_block(q)
         return (
             model.soc_max
             - (model.fcrd_down_E[h] + model.fcrd_down_L[h]) * self.E_FCRD
-            - model.afrr_down[b] * self.E_aFRR
+            - model.afrr_down[h] * self.E_aFRR
             - model.mfrr_down[h] * self.E_mFRR
             >= model.soc[q]
         )
@@ -452,11 +423,10 @@ class Model3:
     def equation_ler_fcrn_up(self, model, q):
         """LER buffer with FCR-N (E+L) + aFRR up + mFRR up."""
         h = self.quarter_to_hour(q)
-        b = self.quarter_to_block(q)
         return (
             model.soc_min
             + (model.fcrn_E[h] + model.fcrn_L[h]) * self.E_FCRN
-            + model.afrr_up[b] * self.E_aFRR
+            + model.afrr_up[h] * self.E_aFRR
             + model.mfrr_up[h] * self.E_mFRR
             <= model.soc[q]
         )
@@ -464,18 +434,16 @@ class Model3:
     def equation_ler_fcrn_down(self, model, q):
         """LER buffer with FCR-N (E+L) + aFRR down + mFRR down."""
         h = self.quarter_to_hour(q)
-        b = self.quarter_to_block(q)
         return (
             model.soc_max
             - (model.fcrn_E[h] + model.fcrn_L[h]) * self.E_FCRN
-            - model.afrr_down[b] * self.E_aFRR
+            - model.afrr_down[h] * self.E_aFRR
             - model.mfrr_down[h] * self.E_mFRR
             >= model.soc[q]
         )
 
     def equation_power_discharge(self, model, q):
         h = self.quarter_to_hour(q)
-        b = self.quarter_to_block(q)
         return (
             model.da_sell[q]
             + model.ffr[h]
@@ -483,21 +451,20 @@ class Model3:
             + model.fcrd_up_L[h]
             + model.fcrn_E[h]
             + model.fcrn_L[h]
-            + model.afrr_up[b]
+            + model.afrr_up[h]
             + model.mfrr_up[h]
             <= model.bat_discharge_eff * model.bat_mw
         )
 
     def equation_power_charge(self, model, q):
         h = self.quarter_to_hour(q)
-        b = self.quarter_to_block(q)
         return (
             model.da_buy[q]
             + model.fcrd_down_E[h]
             + model.fcrd_down_L[h]
             + model.fcrn_E[h]
             + model.fcrn_L[h]
-            + model.afrr_down[b]
+            + model.afrr_down[h]
             + model.mfrr_down[h]
             <= model.bat_mw
         )
@@ -509,11 +476,9 @@ class Model3:
         Q = len(self.df)
         D = Q // 96
         H = Q // 4
-        B = Q // 16
         model.quarters = pyo.RangeSet(1, Q)
         model.days = pyo.RangeSet(1, D)
         model.hours = pyo.RangeSet(1, H)
-        model.blocks = pyo.RangeSet(1, B)
 
         # Scalar parameters
         model.bat_mw = pyo.Param(initialize=self.bat_mw)
@@ -589,24 +554,13 @@ class Model3:
             model.hours,
             initialize={h: _hourly("P_mFRR_down", h) for h in range(1, H + 1)},
         )
-
-        # Block capacity prices
-        B_avail = self.df_block.height
-
-        def _block(col, b):
-            idx = b - 1
-            if idx < B_avail:
-                v = self.df_block[col][idx]
-                return float(v) if v is not None else 0.0
-            return 0.0
-
         model.p_afrr_up = pyo.Param(
-            model.blocks,
-            initialize={b: _block("P_aFRR_up", b) for b in range(1, B + 1)},
+            model.hours,
+            initialize={h: _hourly("P_aFRR_up", h) for h in range(1, H + 1)},
         )
         model.p_afrr_down = pyo.Param(
-            model.blocks,
-            initialize={b: _block("P_aFRR_down", b) for b in range(1, B + 1)},
+            model.hours,
+            initialize={h: _hourly("P_aFRR_down", h) for h in range(1, H + 1)},
         )
 
         # Decision variables
@@ -623,8 +577,8 @@ class Model3:
         model.fcrn_L = pyo.Var(model.hours, bounds=(0, None))
         model.mfrr_up = pyo.Var(model.hours, bounds=(0, None))
         model.mfrr_down = pyo.Var(model.hours, bounds=(0, None))
-        model.afrr_up = pyo.Var(model.blocks, bounds=(0, None))
-        model.afrr_down = pyo.Var(model.blocks, bounds=(0, None))
+        model.afrr_up = pyo.Var(model.hours, bounds=(0, None))
+        model.afrr_down = pyo.Var(model.hours, bounds=(0, None))
 
         # Objective
         model.objective = pyo.Objective(expr=self.equation_1(model), sense=pyo.maximize)
@@ -664,7 +618,6 @@ class Model3:
     def _extract_objectives(self, model) -> tuple[float, float]:
         Q = len(self.df)
         H = Q // 4
-        B = Q // 16
 
         da_sell_vals = [pyo.value(model.da_sell[q]) for q in range(1, Q + 1)]
         da_buy_vals = [pyo.value(model.da_buy[q]) for q in range(1, Q + 1)]
@@ -722,12 +675,12 @@ class Model3:
             for h in range(1, H + 1)
         )
         afrr_up_rev = sum(
-            pyo.value(model.afrr_up[b]) * pyo.value(model.p_afrr_up[b])
-            for b in range(1, B + 1)
+            pyo.value(model.afrr_up[h]) * pyo.value(model.p_afrr_up[h])
+            for h in range(1, H + 1)
         )
         afrr_down_rev = sum(
-            pyo.value(model.afrr_down[b]) * pyo.value(model.p_afrr_down[b])
-            for b in range(1, B + 1)
+            pyo.value(model.afrr_down[h]) * pyo.value(model.p_afrr_down[h])
+            for h in range(1, H + 1)
         )
         reserve_rev = (
             ffr_rev
@@ -883,9 +836,6 @@ class Model3:
         def q_to_h(q: int) -> int:
             return (q - 1) // 4 + 1
 
-        def q_to_b(q: int) -> int:
-            return (q - 1) // 16 + 1
-
         soc = [pyo.value(model.soc[q]) / self.bat_mwh for q in range(1, Q + 1)]
 
         # Day-ahead (quarterly) — sign convention: charge positive, discharge negative
@@ -896,9 +846,6 @@ class Model3:
         def hourly_q(var):
             return [pyo.value(var[q_to_h(q)]) for q in range(1, Q + 1)]
 
-        def block_q(var):
-            return [pyo.value(var[q_to_b(q)]) for q in range(1, Q + 1)]
-
         # Discharge-direction (negative bars)
         ffr_q = [-v for v in hourly_q(model.ffr)]
         fcrd_up_E_q = [-v for v in hourly_q(model.fcrd_up_E)]
@@ -906,7 +853,7 @@ class Model3:
         fcrn_E_up_q = [-v for v in hourly_q(model.fcrn_E)]
         fcrn_L_up_q = [-v for v in hourly_q(model.fcrn_L)]
         mfrr_up_q = [-v for v in hourly_q(model.mfrr_up)]
-        afrr_up_q = [-v for v in block_q(model.afrr_up)]
+        afrr_up_q = [-v for v in hourly_q(model.afrr_up)]
 
         # Charge-direction (positive bars)
         fcrd_down_E_q = hourly_q(model.fcrd_down_E)
@@ -914,7 +861,7 @@ class Model3:
         fcrn_E_down_q = hourly_q(model.fcrn_E)
         fcrn_L_down_q = hourly_q(model.fcrn_L)
         mfrr_down_q = hourly_q(model.mfrr_down)
-        afrr_down_q = block_q(model.afrr_down)
+        afrr_down_q = hourly_q(model.afrr_down)
 
         fig = make_subplots(specs=[[{"secondary_y": True}]])
 

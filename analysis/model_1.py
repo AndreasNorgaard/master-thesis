@@ -32,7 +32,7 @@ class Model1:
 
         # Tariffs (Appendix B of thesis, DKK/MWh)
         # Production tariff (discharging): TSO (5.0 + 5.3) + DSO (5.2) = 15.5 DKK/MWh
-        self.tariff_prod = 15.5
+        self.tariff_prod = 15.0
 
         # Consumption tariff (charging): time-varying, computed in load_data()
         # τ_c_q = systemtarif + nettabstarif_q + DSO_q
@@ -82,8 +82,8 @@ class Model1:
                     & (pl.col("hour") >= 6)
                     & (~pl.col("is_holiday"))
                 )
-                .then(91.1)
-                .otherwise(30.4)
+                .then(72.9)
+                .otherwise(24.3)
                 .alias("dso_tariff")
             )
             .with_columns(

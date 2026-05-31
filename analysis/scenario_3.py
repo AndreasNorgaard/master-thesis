@@ -41,10 +41,11 @@ class Model4(Model3):
         "fcrd_up_L",
         "fcrd_down_E",
         "fcrd_down_L",
+        "afrr_up",
+        "afrr_down",
         "mfrr_up",
         "mfrr_down",
     }
-    BLOCK_VARS = {"afrr_up", "afrr_down"}
 
     PARETO_WEIGHTS = (
         [(0.9999, 0.0001)]
@@ -72,12 +73,10 @@ class Model4(Model3):
         "fcrd_down_L": "P_FCRD_down_L",
         "fcrn_E": "P_FCRN_E",
         "fcrn_L": "P_FCRN_L",
-        "mfrr_up": "P_mFRR_up",
-        "mfrr_down": "P_mFRR_down",
-    }
-    BLOCK_PRICE_COLS = {
         "afrr_up": "P_aFRR_up",
         "afrr_down": "P_aFRR_down",
+        "mfrr_up": "P_mFRR_up",
+        "mfrr_down": "P_mFRR_down",
     }
 
     def __init__(
@@ -122,30 +121,27 @@ class Model4(Model3):
         df_fcr_nd = client.fcr_nd_capacity(write_to_file=False)
         df_afrr = client.afrr_capacity(write_to_file=False)
         df_mfrr = client.mfrr_capacity(write_to_file=False)
-        df_full, df_hourly_full, df_block_full = self.create_dataset(
+        df_full, df_hourly_full = self.create_dataset(
             df_da, df_co2, df_ffr, df_fcr_nd, df_afrr, df_mfrr
         )
 
-        # First 96 quarters / 24 hours / 6 blocks belong to the prior day.
+        # First 96 quarters / 24 hours belong to the prior day.
         self.df_prior = df_full.slice(0, 96)
         self.df_hourly_prior = df_hourly_full.slice(0, 24)
-        self.df_block_prior = df_block_full.slice(0, 6)
         # The remaining rows are the optimisation horizon proper.
         self.df = df_full.slice(96, df_full.height - 96)
         self.df_hourly = df_hourly_full.slice(24, df_hourly_full.height - 24)
-        self.df_block = df_block_full.slice(6, df_block_full.height - 6)
 
-    def _realized_day(self, d: int) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
-        """Return realized (quarterly, hourly, block) frames for delivery day d.
+    def _realized_day(self, d: int) -> tuple[pl.DataFrame, pl.DataFrame]:
+        """Return realized (quarterly, hourly) frames for delivery day d.
 
         d == 0 returns the prior day (loaded by `_load_prior_day`).
         """
         if d == 0:
-            return self.df_prior, self.df_hourly_prior, self.df_block_prior
+            return self.df_prior, self.df_hourly_prior
         return (
             self.df.slice(96 * (d - 1), 96),
             self.df_hourly.slice(24 * (d - 1), 24),
-            self.df_block.slice(6 * (d - 1), 6),
         )
 
     @staticmethod
@@ -167,11 +163,10 @@ class Model4(Model3):
 
     def equation_ler_fcrd_up(self, model, q):
         h = self.quarter_to_hour(q)
-        b = self.quarter_to_block(q)
         return (
             model.soc_min
             + (model.fcrd_up_E[h] + model.fcrd_up_L[h]) * self.E_FCRD
-            + model.afrr_up[b] * self.E_aFRR
+            + model.afrr_up[h] * self.E_aFRR
             + model.mfrr_up[h] * self.E_mFRR
             - self.NUM_TOL
             <= model.soc[q]
@@ -179,11 +174,10 @@ class Model4(Model3):
 
     def equation_ler_fcrd_down(self, model, q):
         h = self.quarter_to_hour(q)
-        b = self.quarter_to_block(q)
         return (
             model.soc_max
             - (model.fcrd_down_E[h] + model.fcrd_down_L[h]) * self.E_FCRD
-            - model.afrr_down[b] * self.E_aFRR
+            - model.afrr_down[h] * self.E_aFRR
             - model.mfrr_down[h] * self.E_mFRR
             + self.NUM_TOL
             >= model.soc[q]
@@ -191,11 +185,10 @@ class Model4(Model3):
 
     def equation_ler_fcrn_up(self, model, q):
         h = self.quarter_to_hour(q)
-        b = self.quarter_to_block(q)
         return (
             model.soc_min
             + (model.fcrn_E[h] + model.fcrn_L[h]) * self.E_FCRN
-            + model.afrr_up[b] * self.E_aFRR
+            + model.afrr_up[h] * self.E_aFRR
             + model.mfrr_up[h] * self.E_mFRR
             - self.NUM_TOL
             <= model.soc[q]
@@ -203,11 +196,10 @@ class Model4(Model3):
 
     def equation_ler_fcrn_down(self, model, q):
         h = self.quarter_to_hour(q)
-        b = self.quarter_to_block(q)
         return (
             model.soc_max
             - (model.fcrn_E[h] + model.fcrn_L[h]) * self.E_FCRN
-            - model.afrr_down[b] * self.E_aFRR
+            - model.afrr_down[h] * self.E_aFRR
             - model.mfrr_down[h] * self.E_mFRR
             + self.NUM_TOL
             >= model.soc[q]
@@ -215,7 +207,6 @@ class Model4(Model3):
 
     def equation_power_discharge(self, model, q):
         h = self.quarter_to_hour(q)
-        b = self.quarter_to_block(q)
         return (
             model.da_sell[q]
             + model.ffr[h]
@@ -223,21 +214,20 @@ class Model4(Model3):
             + model.fcrd_up_L[h]
             + model.fcrn_E[h]
             + model.fcrn_L[h]
-            + model.afrr_up[b]
+            + model.afrr_up[h]
             + model.mfrr_up[h]
             <= model.bat_discharge_eff * model.bat_mw + self.NUM_TOL
         )
 
     def equation_power_charge(self, model, q):
         h = self.quarter_to_hour(q)
-        b = self.quarter_to_block(q)
         return (
             model.da_buy[q]
             + model.fcrd_down_E[h]
             + model.fcrd_down_L[h]
             + model.fcrn_E[h]
             + model.fcrn_L[h]
-            + model.afrr_down[b]
+            + model.afrr_down[h]
             + model.mfrr_down[h]
             <= model.bat_mw + self.NUM_TOL
         )
@@ -266,21 +256,18 @@ class Model4(Model3):
         q_end = min(96 * (delivery_day + self.lookahead_days), Q_total)
         h_start = (q_start - 1) // 4 + 1
         h_end = q_end // 4
-        b_start = (q_start - 1) // 16 + 1
-        b_end = q_end // 16
         d_start = delivery_day
         d_end = (q_end - 1) // 96 + 1
 
         end_at_horizon = q_end == Q_total
 
-        prior_q, prior_h, prior_b = (
-            self._realized_day(delivery_day - 1) if use_forecast else (None, None, None)
+        prior_q, prior_h = (
+            self._realized_day(delivery_day - 1) if use_forecast else (None, None)
         )
 
         model = pyo.ConcreteModel()
         model.quarters = pyo.RangeSet(q_start, q_end)
         model.hours = pyo.RangeSet(h_start, h_end)
-        model.blocks = pyo.RangeSet(b_start, b_end)
         model.days = pyo.RangeSet(d_start, d_end)
 
         # Scalar parameters
@@ -329,18 +316,6 @@ class Model4(Model3):
                     init[h] = self._opt_float(self.df_hourly[col][h - 1])
             setattr(model, attr, pyo.Param(model.hours, initialize=init))
 
-        # Block capacity prices
-        for var_name, col in self.BLOCK_PRICE_COLS.items():
-            attr = f"p_{var_name}"
-            init = {}
-            for b in range(b_start, b_end + 1):
-                tod_b = (b - 1) % 6
-                if use_forecast:
-                    init[b] = self._opt_float(prior_b[col][tod_b])
-                else:
-                    init[b] = self._opt_float(self.df_block[col][b - 1])
-            setattr(model, attr, pyo.Param(model.blocks, initialize=init))
-
         # Decision variables
         model.da_buy = pyo.Var(model.quarters, bounds=self.equation_2)
         model.da_sell = pyo.Var(model.quarters, bounds=self.equation_3)
@@ -354,8 +329,8 @@ class Model4(Model3):
         model.fcrn_L = pyo.Var(model.hours, bounds=(0, None))
         model.mfrr_up = pyo.Var(model.hours, bounds=(0, None))
         model.mfrr_down = pyo.Var(model.hours, bounds=(0, None))
-        model.afrr_up = pyo.Var(model.blocks, bounds=(0, None))
-        model.afrr_down = pyo.Var(model.blocks, bounds=(0, None))
+        model.afrr_up = pyo.Var(model.hours, bounds=(0, None))
+        model.afrr_down = pyo.Var(model.hours, bounds=(0, None))
 
         # Pin already-decided bids for this delivery day. Instead of a hard
         # .fix(value), we narrow the variable's bounds to a small interval
@@ -454,8 +429,6 @@ class Model4(Model3):
         day_q_end = 96 * delivery_day
         day_h_start = 24 * (delivery_day - 1) + 1
         day_h_end = 24 * delivery_day
-        day_b_start = 6 * (delivery_day - 1) + 1
-        day_b_end = 6 * delivery_day
 
         # Strict upper bounds on the LP variables. These are only used to
         # clean up bid values reported externally (objective evaluation,
@@ -472,8 +445,6 @@ class Model4(Model3):
                 rng = range(day_q_start, day_q_end + 1)
             elif product in self.HOURLY_VARS:
                 rng = range(day_h_start, day_h_end + 1)
-            elif product in self.BLOCK_VARS:
-                rng = range(day_b_start, day_b_end + 1)
             else:
                 raise ValueError(f"Unknown product {product}")
             upper = upper_bounds.get(product)
@@ -534,7 +505,6 @@ class Model4(Model3):
         """
         Q = len(self.df)
         H = Q // 4
-        B = Q // 16
         dt = self.delta_t
 
         def q_bid(name, q):
@@ -542,9 +512,6 @@ class Model4(Model3):
 
         def h_bid(name, h):
             return bids.get((name, h), 0.0)
-
-        def b_bid(name, b):
-            return bids.get((name, b), 0.0)
 
         da_buy = [q_bid("da_buy", q) for q in range(1, Q + 1)]
         da_sell = [q_bid("da_sell", q) for q in range(1, Q + 1)]
@@ -565,12 +532,6 @@ class Model4(Model3):
                 for h in range(1, H + 1)
             )
 
-        def block_rev(name, col):
-            return sum(
-                b_bid(name, b) * self._opt_float(self.df_block[col][b - 1])
-                for b in range(1, B + 1)
-            )
-
         ffr_rev = hourly_rev("ffr", "P_FFR")
         fcrd_up_E_rev = hourly_rev("fcrd_up_E", "P_FCRD_up_E")
         fcrd_up_L_rev = hourly_rev("fcrd_up_L", "P_FCRD_up_L")
@@ -580,8 +541,8 @@ class Model4(Model3):
         fcrn_L_rev = hourly_rev("fcrn_L", "P_FCRN_L")
         mfrr_up_rev = hourly_rev("mfrr_up", "P_mFRR_up")
         mfrr_down_rev = hourly_rev("mfrr_down", "P_mFRR_down")
-        afrr_up_rev = block_rev("afrr_up", "P_aFRR_up")
-        afrr_down_rev = block_rev("afrr_down", "P_aFRR_down")
+        afrr_up_rev = hourly_rev("afrr_up", "P_aFRR_up")
+        afrr_down_rev = hourly_rev("afrr_down", "P_aFRR_down")
 
         reserve_rev = (
             ffr_rev
@@ -657,7 +618,6 @@ class Model4(Model3):
             bat_mwh=self.bat_mwh,
             df=self.df,
             df_hourly=self.df_hourly,
-            df_block=self.df_block,
         )
         results: list[dict] = []
         for lp, lc in self.PARETO_WEIGHTS:
