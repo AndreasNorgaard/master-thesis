@@ -319,6 +319,7 @@ class Model1:
             margin=dict(l=0, r=0, t=20, b=10),
         )
         fig.show()
+        Path("results/model_1").mkdir(parents=True, exist_ok=True)
         fig.write_image("results/model_1/profit.png")
 
     def visualize_schedule(self, model):
@@ -408,6 +409,7 @@ class Model1:
         )
 
         fig.show()
+        Path("results/model_1").mkdir(parents=True, exist_ok=True)
         fig.write_image("results/model_1/schedule.png")
 
     def visualize_schedule_with_price(self, model):
@@ -483,6 +485,7 @@ class Model1:
         )
 
         fig.show()
+        Path("results/model_1").mkdir(parents=True, exist_ok=True)
         fig.write_image("results/model_1/schedule_with_price.png")
 
 

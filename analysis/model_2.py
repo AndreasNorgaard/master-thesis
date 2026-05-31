@@ -399,6 +399,7 @@ class Model2:
             margin=dict(l=0, r=0, t=20, b=10),
         )
         fig.show()
+        Path("results/model_2").mkdir(parents=True, exist_ok=True)
         fig.write_image("results/model_2/pareto_frontier.png")
 
 

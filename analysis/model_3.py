@@ -822,6 +822,7 @@ class Model3:
             margin=dict(l=0, r=0, t=20, b=10),
         )
         fig.show()
+        Path(out_file).parent.mkdir(parents=True, exist_ok=True)
         fig.write_image(out_file)
 
     def visualize_schedule(
@@ -951,6 +952,7 @@ class Model3:
         )
 
         fig.show()
+        Path(out_file).parent.mkdir(parents=True, exist_ok=True)
         fig.write_image(out_file)
 
     def pareto_frontier(self) -> list[dict]:
@@ -1098,6 +1100,7 @@ class Model3:
             margin=dict(l=0, r=0, t=40, b=10),
         )
         fig.show()
+        Path("results/model_3").mkdir(parents=True, exist_ok=True)
         fig.write_image("results/model_3/pareto_frontier.png")
 
 
