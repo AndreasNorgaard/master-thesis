@@ -34,15 +34,8 @@ class Model2:
         self.n_cycles = 2  # Max full cycles per day (contractual limit)
 
         # Tariffs (Appendix B of thesis, DKK/MWh)
-        # Production tariff (discharging): TSO (5.0 + 5.3) + DSO (5.2) = 15.5 DKK/MWh
+        # Production tariff (discharging)
         self.tariff_prod = 15.0
-
-        # Consumption tariff (charging): time-varying, computed in create_dataset()
-        # τ_c_q = systemtarif + nettabstarif_q + DSO_q
-        #   systemtarif   = 72 DKK/MWh (fixed)
-        #   nettabstarif  = 1.42% × (P_spot_q + 26 DKK/MWh)
-        #   DSO_q         = 30.4 DKK/MWh (00:00–06:00 weekdays and all weekends)
-        #                 = 91.1 DKK/MWh (06:00–24:00 weekdays)
 
         # Load data
         self.load_data()
