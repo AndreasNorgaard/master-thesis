@@ -88,7 +88,7 @@ class Model4(Model3):
         lookahead_days: int = 2,
     ):
         # Energi Data Service treats `end` as exclusive, so passing
-        # 2026-04-30 yields 29 delivery days (Apr 1 .. Apr 29). We mirror
+        # 2026-05-01 yields 30 delivery days (Apr 1 .. Apr 30). We mirror
         # Model 3's convention here so the two horizons are identical and
         # the frontiers are directly comparable.
         super().__init__(start_date, end_date, bat_mw, bat_mwh)
@@ -996,7 +996,7 @@ class Model4(Model3):
         print(f"Look-ahead comparison saved to {out}")
 
 
-def run_debug_schedules(start: str = "2026-04-01", end: str = "2026-04-30") -> None:
+def run_debug_schedules(start: str = "2026-04-01", end: str = "2026-05-01") -> None:
     """Re-solve the realized-price sequential model (look-ahead = 2) at the
     (0.9999, 0.0001) weight pair and dump per-day production schedules, plus
     the Model 3 perfect-foresight schedule for the same weights.
@@ -1028,7 +1028,7 @@ if __name__ == "__main__":
         sys.exit(0)
 
     START = "2026-04-01"
-    END = "2026-04-30"
+    END = "2026-05-01"
     LOOKAHEAD = 2
 
     # Prefer Model 3's own 101-point sweep if it has already been generated;

@@ -487,7 +487,7 @@ class Model1:
 
 
 if __name__ == "__main__":
-    m = Model1(start_date="2026-04-01", end_date="2026-04-30")
+    m = Model1(start_date="2026-04-01", end_date="2026-05-01")
     solved = m.solve()
     m.calculate_profit(solved)
     m.visualize_profit()

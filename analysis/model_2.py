@@ -405,7 +405,7 @@ class Model2:
 if __name__ == "__main__":
     m = Model2(
         start_date="2026-04-01",
-        end_date="2026-04-30",
+        end_date="2026-05-01",
     )
     pareto_results = m.pareto_frontier()
     m.save_results(pareto_results)

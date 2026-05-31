@@ -7,7 +7,7 @@ import xlsxwriter
 from analysis.model_3 import Model3
 
 START_DATE = "2026-04-01"
-END_DATE = "2026-04-30"
+END_DATE = "2026-05-01"
 
 CONFIGS = [
     (2, 2),
